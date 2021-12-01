@@ -30,7 +30,7 @@ import traceback
 from functools import partial
 from typing import List, TYPE_CHECKING, Tuple, NamedTuple, Any, Dict, Optional, Union
 
-from . import ravencoin
+from . import bitcoin
 from . import keystore
 from . import mnemonic
 from .bip32 import is_bip32_derivation, xpub_type, normalize_bip32_derivation, BIP32Node
@@ -145,9 +145,9 @@ class BaseWizard(Logger):
         ])
         wallet_kinds = [
             ('standard',  _("Standard wallet")),
-            #('2fa', _("Wallet with two-factor authentication")),
-            #('multisig',  _("Multi-signature wallet (advanced)")),
-            ('imported',  _("Import Ravencoin addresses or private keys")),
+            ('2fa', _("Wallet with two-factor authentication")),
+            ('multisig',  _("Multi-signature wallet")),
+            ('imported',  _("Import Bitcoin addresses or private keys")),
         ]
         choices = [pair for pair in wallet_kinds if pair[0] in wallet_types]
         self.choice_dialog(title=title, message=message, choices=choices, run_next=self.on_wallet_type)
@@ -185,9 +185,9 @@ class BaseWizard(Logger):
             action = 'choose_keystore'
         elif choice == 'multisig':
             action = 'choose_multisig'
-        #elif choice == '2fa':
-        #    self.load_2fa()
-        #    action = self.plugin.get_action(self.data)
+        elif choice == '2fa':
+            self.load_2fa()
+            action = self.plugin.get_action(self.data)
         elif choice == 'imported':
             action = 'import_addresses_or_keys'
         self.run(action)
@@ -226,8 +226,8 @@ class BaseWizard(Logger):
 
     def import_addresses_or_keys(self):
         v = lambda x: keystore.is_address_list(x) or keystore.is_private_key_list(x, raise_on_error=True)
-        title = _("Import Ravencoin Addresses")
-        message = _("Enter a list of Ravencoin addresses (this will create a watching-only wallet), or a list of private keys.")
+        title = _("Import Bitcoin Addresses")
+        message = _("Enter a list of Bitcoin addresses (this will create a watching-only wallet), or a list of private keys.")
         self.add_xpub_dialog(title=title, message=message, run_next=self.on_import,
                              is_valid=v, allow_multi=True, show_wif_help=True)
 
@@ -236,16 +236,16 @@ class BaseWizard(Logger):
         if keystore.is_address_list(text):
             self.data['addresses'] = {}
             for addr in text.split():
-                assert ravencoin.is_address(addr)
+                assert bitcoin.is_address(addr)
                 self.data['addresses'][addr] = {}
         elif keystore.is_private_key_list(text):
             self.data['addresses'] = {}
             k = keystore.Imported_KeyStore({})
             keys = keystore.get_private_keys(text)
             for pk in keys:
-                assert ravencoin.is_private_key(pk)
+                assert bitcoin.is_private_key(pk)
                 txin_type, pubkey = k.import_privkey(pk, None)
-                addr = ravencoin.pubkey_to_address(txin_type, pubkey)
+                addr = bitcoin.pubkey_to_address(txin_type, pubkey)
                 self.data['addresses'][addr] = {'type':txin_type, 'pubkey':pubkey}
             self.keystores.append(k)
         else:
@@ -260,7 +260,6 @@ class BaseWizard(Logger):
                 _("To create a watching-only wallet, please enter your master public key (xpub/ypub/zpub)."),
                 _("To create a spending wallet, please enter a master private key (xprv/yprv/zprv).")
             ])
-            self.seed_type = 'standard'
             self.add_xpub_dialog(title=title, message=message, run_next=self.on_restore_from_key, is_valid=v)
         else:
             i = len(self.keystores) + 1
@@ -418,14 +417,11 @@ class BaseWizard(Logger):
             # There is no general standard for HD multisig.
             # For legacy, this is partially compatible with BIP45; assumes index=0
             # For segwit, a custom path is used, as there is no standard at all.
-            default_choice_idx = 0
+            default_choice_idx = 2
             choices = [
                 ('standard',   'legacy multisig (p2sh)',            normalize_bip32_derivation("m/45'/0")),
-
-                # Ravencoin does not current support segwit
-
-                # ('p2wsh-p2sh', 'p2sh-segwit multisig (p2wsh-p2sh)', purpose48_derivation(0, xtype='p2wsh-p2sh')),
-                # ('p2wsh',      'native segwit multisig (p2wsh)',    purpose48_derivation(0, xtype='p2wsh')),
+                ('p2wsh-p2sh', 'p2sh-segwit multisig (p2wsh-p2sh)', purpose48_derivation(0, xtype='p2wsh-p2sh')),
+                ('p2wsh',      'native segwit multisig (p2wsh)',    purpose48_derivation(0, xtype='p2wsh')),
             ]
             # if this is not the first cosigner, pre-select the expected script type,
             # and hide the choices
@@ -436,11 +432,11 @@ class BaseWizard(Logger):
                 default_choice_idx = chosen_idx
                 hide_choices = True
         else:
-            default_choice_idx = 0
+            default_choice_idx = 2
             choices = [
                 ('standard',    'legacy (p2pkh)',            bip44_derivation(0, bip43_purpose=44)),
-                # ('p2wpkh-p2sh', 'p2sh-segwit (p2wpkh-p2sh)', bip44_derivation(0, bip43_purpose=49)),
-                # ('p2wpkh',      'native segwit (p2wpkh)',    bip44_derivation(0, bip43_purpose=84)),
+                ('p2wpkh-p2sh', 'p2sh-segwit (p2wpkh-p2sh)', bip44_derivation(0, bip43_purpose=49)),
+                ('p2wpkh',      'native segwit (p2wpkh)',    bip44_derivation(0, bip43_purpose=84)),
             ]
         while True:
             try:
@@ -524,7 +520,7 @@ class BaseWizard(Logger):
         if self.seed_type == 'bip39':
             def f(passphrase):
                 root_seed = bip39_to_seed(seed, passphrase)
-                self.on_restore_bip43(root_seed, seed=seed, passphrase=passphrase)
+                self.on_restore_bip43(root_seed)
             self.passphrase_dialog(run_next=f, is_restoring=True) if is_ext else f('')
         elif self.seed_type == 'slip39':
             def f(passphrase):
@@ -542,10 +538,10 @@ class BaseWizard(Logger):
         else:
             raise Exception('Unknown seed type', self.seed_type)
 
-    def on_restore_bip43(self, root_seed, *, seed=None, passphrase=None):
+    def on_restore_bip43(self, root_seed):
         def f(derivation, script_type):
             derivation = normalize_bip32_derivation(derivation)
-            self.run('on_bip43', root_seed, derivation, script_type, seed, passphrase)
+            self.run('on_bip43', root_seed, derivation, script_type)
         if self.wallet_type == 'standard':
             def get_account_xpub(account_path):
                 root_node = BIP32Node.from_rootseed(root_seed, xtype="standard")
@@ -557,19 +553,13 @@ class BaseWizard(Logger):
         self.derivation_and_script_type_dialog(f, get_account_xpub=get_account_xpub)
 
     def create_keystore(self, seed, passphrase):
-        self.logger.info('Creating keystore...')
-        if self.seed_type == 'bip39':
-            root_seed = bip39_to_seed(seed, passphrase if passphrase else '')
-            derivation = normalize_bip32_derivation(bip44_derivation(0))
-            k = keystore.from_bip43_rootseed(root_seed, derivation, xtype='standard', seed=seed, passphrase=passphrase)
-        else:
-            k = keystore.from_seed(seed, passphrase, self.wallet_type == 'multisig')
+        k = keystore.from_seed(seed, passphrase, self.wallet_type == 'multisig')
         if k.can_have_deterministic_lightning_xprv():
             self.data['lightning_xprv'] = k.get_lightning_xprv(None)
         self.on_keystore(k)
 
-    def on_bip43(self, root_seed, derivation, script_type, seed=None, passphrase=None):
-        k = keystore.from_bip43_rootseed(root_seed, derivation, xtype=script_type, seed=seed, passphrase=passphrase)
+    def on_bip43(self, root_seed, derivation, script_type):
+        k = keystore.from_bip43_rootseed(root_seed, derivation, xtype=script_type)
         self.on_keystore(k)
 
     def get_script_type_of_wallet(self) -> Optional[str]:
@@ -712,16 +702,15 @@ class BaseWizard(Logger):
 
     def create_seed(self, seed_type):
         from . import mnemonic
-        # seed = mnemonic.Mnemonic('en').make_seed(seed_type=self.seed_type)
-        seed = mnemonic.Mnemonic('en').make_bip39_seed()
-        self.opt_bip39 = True #False
-        self.opt_ext = False #True
+        self.seed_type = seed_type
+        seed = mnemonic.Mnemonic('en').make_seed(seed_type=self.seed_type)
+        self.opt_bip39 = False
+        self.opt_ext = True
         self.opt_slip39 = False
-        f = lambda x: self.request_passphrase(x)
-        self.show_seed_dialog(run_next=f, seed_text=seed, electrum_seed_type=seed_type)
+        f = lambda x: self.request_passphrase(seed, x)
+        self.show_seed_dialog(run_next=f, seed_text=seed)
 
-    def request_passphrase(self, opt_passphrase):
-        seed = self.seed
+    def request_passphrase(self, seed, opt_passphrase):
         if opt_passphrase:
             f = lambda x: self.confirm_seed(seed, x)
             self.passphrase_dialog(run_next=f)
@@ -729,12 +718,10 @@ class BaseWizard(Logger):
             self.run('confirm_seed', seed, '')
 
     def confirm_seed(self, seed, passphrase):
-        self.logger.info('Confirming Seed...')
         f = lambda x: self.confirm_passphrase(seed, passphrase)
         self.confirm_seed_dialog(run_next=f, seed=seed if self.config.get('debug_seed') else '', test=lambda x: x==seed)
 
     def confirm_passphrase(self, seed, passphrase):
-        self.logger.info('Confirming Passphrase...')
         f = lambda x: self.run('create_keystore', seed, x)
         if passphrase:
             title = _('Confirm Seed Extension')

@@ -28,7 +28,7 @@ import aiorpcx
 
 from .util import bh2u, TxMinedInfo, NetworkJobOnDefaultServer
 from .crypto import sha256d
-from .ravencoin import hash_decode, hash_encode
+from .bitcoin import hash_decode, hash_encode
 from .transaction import Transaction
 from .blockchain import hash_header
 from .interface import GracefulDisconnect
@@ -95,10 +95,17 @@ class SPV(NetworkJobOnDefaultServer):
             self.requested_merkle.add(tx_hash)
             await self.taskgroup.spawn(self._request_and_verify_single_proof, tx_hash, tx_height)
 
-    async def request_and_verfiy_proof(self, tx_hash, tx_height):
-        async with self._network_request_semaphore:
-            merkle = await self.network.get_merkle_for_transaction(tx_hash, tx_height)
-
+    async def _request_and_verify_single_proof(self, tx_hash, tx_height):
+        try:
+            async with self._network_request_semaphore:
+                merkle = await self.network.get_merkle_for_transaction(tx_hash, tx_height)
+        except UntrustedServerReturnedError as e:
+            if not isinstance(e.original_exception, aiorpcx.jsonrpc.RPCError):
+                raise
+            self.logger.info(f'tx {tx_hash} not at height {tx_height}')
+            self.wallet.remove_unverified_tx(tx_hash, tx_height)
+            self.requested_merkle.discard(tx_hash)
+            return
         # Verify the hash of the server-provided merkle branch to a
         # transaction matches the merkle root of its block
         if tx_height != merkle.get('block_height'):
@@ -118,24 +125,10 @@ class SPV(NetworkJobOnDefaultServer):
             else:
                 self.logger.info(repr(e))
                 raise GracefulDisconnect(e) from e
-        return header, pos
-
-    async def _request_and_verify_single_proof(self, tx_hash, tx_height):
-        try:
-            header, pos = await self.request_and_verfiy_proof(tx_hash, tx_height)
-        except UntrustedServerReturnedError as e:
-            if not isinstance(e.original_exception, aiorpcx.jsonrpc.RPCError):
-                raise
-            self.logger.info(f'tx {tx_hash} not at height {tx_height}')
-            self.wallet.remove_unverified_tx(tx_hash, tx_height)
-            self.requested_merkle.discard(tx_hash)
-            return
-
         # we passed all the tests
         self.merkle_roots[tx_hash] = header.get('merkle_root')
-        self.logger.info(f"verified {tx_hash}")
         self.requested_merkle.discard(tx_hash)
-
+        self.logger.info(f"verified {tx_hash}")
         header_hash = hash_header(header)
         tx_info = TxMinedInfo(height=tx_height,
                               timestamp=header.get('timestamp'),

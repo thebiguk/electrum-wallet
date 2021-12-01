@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Optional
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
 is_bundle = getattr(sys, 'frozen', False)
-is_local = not is_bundle and os.path.exists(os.path.join(script_dir, "electrum-ravencoin.desktop"))
+is_local = not is_bundle and os.path.exists(os.path.join(script_dir, "electrum.desktop"))
 is_android = 'ANDROID_DATA' in os.environ
 
 if is_local:  # running from source
@@ -81,7 +81,7 @@ if not is_android:
 sys._ELECTRUM_RUNNING_VIA_RUNELECTRUM = True  # used by logging.py
 
 from electrum.logging import get_logger, configure_logging  # import logging submodule first
-from electrum import util, header_verification
+from electrum import util
 from electrum import constants
 from electrum import SimpleConfig
 from electrum.wallet_db import WalletDB
@@ -166,7 +166,7 @@ def init_cmdline(config_options, wallet_path, server, *, config: 'SimpleConfig')
 
     config_options['password'] = config_options.get('password') or password
 
-    if cmd.name == 'password':
+    if cmd.name == 'password' and 'new_password' not in config_options:
         new_password = prompt_password('New password:')
         config_options['new_password'] = new_password
 
@@ -334,7 +334,7 @@ def main():
         config_options['portable'] = True
 
     if config_options.get('portable'):
-        config_options['electrum_path'] = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'electrum_ravencoin_data')
+        config_options['electrum_path'] = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'electrum_data')
 
     if not config_options.get('verbosity'):
         warnings.simplefilter('ignore', DeprecationWarning)
@@ -349,8 +349,6 @@ def main():
         sys.exit(1)
 
     config = SimpleConfig(config_options)
-    # Segwit is not currently supported
-    config.set_key('nosegwit', True)
 
     # set language as early as possible
     # Note: we are already too late for strings that are declared in the global scope
@@ -361,9 +359,7 @@ def main():
     set_language(config.get('language'))
 
     if config.get('testnet'):
-        from electrum import blockchain
         constants.set_testnet()
-        blockchain.set_constants()
     elif config.get('regtest'):
         constants.set_regtest()
     elif config.get('simnet'):
@@ -477,5 +473,4 @@ def handle_cmd(*, cmdname: str, config: 'SimpleConfig', config_options: dict):
 
 
 if __name__ == '__main__':
-    header_verification.spawn_process()
     main()

@@ -354,7 +354,7 @@ class ChannelDB(SqlDB):
     def get_200_randomly_sorted_nodes_not_in(self, node_ids):
         with self.lock:
             unshuffled = set(self._nodes.keys()) - node_ids
-        return random.sample(unshuffled, min(200, len(unshuffled)))
+        return random.sample(list(unshuffled), min(200, len(unshuffled)))
 
     def get_last_good_address(self, node_id: bytes) -> Optional[LNPeerAddr]:
         """Returns latest address we successfully connected to, for given node."""
@@ -582,8 +582,8 @@ class ChannelDB(SqlDB):
     @classmethod
     def verify_channel_announcement(cls, payload) -> None:
         h = sha256d(payload['raw'][2+256:])
-        pubkeys = [payload['node_id_1'], payload['node_id_2'], payload['ravencoin_key_1'], payload['ravencoin_key_2']]
-        sigs = [payload['node_signature_1'], payload['node_signature_2'], payload['ravencoin_signature_1'], payload['ravencoin_signature_2']]
+        pubkeys = [payload['node_id_1'], payload['node_id_2'], payload['bitcoin_key_1'], payload['bitcoin_key_2']]
+        sigs = [payload['node_signature_1'], payload['node_signature_2'], payload['bitcoin_signature_1'], payload['bitcoin_signature_2']]
         for pubkey, sig in zip(pubkeys, sigs):
             if not ecc.verify_signature(pubkey, sig, h):
                 raise InvalidGossipMsg('signature failed')

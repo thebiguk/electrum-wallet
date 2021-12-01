@@ -26,7 +26,7 @@
 
 
 # Note: The deserialization code originally comes from ABE.
-import logging
+
 import struct
 import traceback
 import sys
@@ -40,16 +40,15 @@ import itertools
 import binascii
 import copy
 
-from . import ecc, ravencoin, constants, segwit_addr, bip32, assets
-from .assets import guess_asset_script_for_vin
+from . import ecc, bitcoin, constants, segwit_addr, bip32
 from .bip32 import BIP32Node
-from .util import profiler, to_bytes, bh2u, bfh, chunks, is_hex_str, Satoshis
-from .ravencoin import (TYPE_ADDRESS, TYPE_SCRIPT, hash_160,
-                        hash160_to_p2sh, hash160_to_p2pkh, hash_to_segwit_addr,
-                        var_int, TOTAL_COIN_SUPPLY_LIMIT_IN_BTC, COIN,
-                        int_to_hex, push_script, b58_address_to_hash160,
-                        opcodes, add_number_to_script, base_decode, is_segwit_script_type,
-                        base_encode, construct_witness, construct_script)
+from .util import profiler, to_bytes, bh2u, bfh, chunks, is_hex_str, parse_max_spend
+from .bitcoin import (TYPE_ADDRESS, TYPE_SCRIPT, hash_160,
+                      hash160_to_p2sh, hash160_to_p2pkh, hash_to_segwit_addr,
+                      var_int, TOTAL_COIN_SUPPLY_LIMIT_IN_BTC, COIN,
+                      int_to_hex, push_script, b58_address_to_hash160,
+                      opcodes, add_number_to_script, base_decode, is_segwit_script_type,
+                      base_encode, construct_witness, construct_script)
 from .crypto import sha256d
 from .logging import get_logger
 
@@ -89,171 +88,38 @@ class MissingTxInputAmount(Exception):
     pass
 
 
-class SIGHASH(IntEnum):
-    ALL = 0x01
-    NONE = 0x02
-    SINGLE = 0x03
+class Sighash(IntEnum):
+    ALL = 1
+    NONE = 2
+    SINGLE = 3
     ANYONECANPAY = 0x80
-    ALL_ANYONECANPAY = ALL + ANYONECANPAY
-    NONE_ANYONECANPAY = NONE + ANYONECANPAY
-    SINGLE_ANYONECANPAY = SINGLE + ANYONECANPAY
 
-
-class RavenValue:  # The raw RVN value as well as asset values of a transaction
-    @staticmethod
-    def from_json(d: Dict):
-        assert 'RVN' in d and 'ASSETS' in d
-        return RavenValue(d['RVN'], d['ASSETS'])
-
-    def __init__(self, rvn: Union[int, Satoshis] = 0, assets=None):
-        if assets is None:
-            assets = {}
-        assert isinstance(rvn, int) or isinstance(rvn, Satoshis)
-        assert isinstance(assets, Dict)
-        if isinstance(rvn, int):
-            self.__rvn_value = Satoshis(rvn)
-        else:
-            self.__rvn_value = rvn
-        self.__asset_value = {k: (Satoshis(v) if isinstance(v, int) else v) for k, v in assets.items()}
-
-    @property
-    def rvn_value(self) -> Satoshis:
-        return self.__rvn_value
-
-    @property
-    def assets(self) -> Dict[str, Satoshis]:
-        return copy.copy(self.__asset_value)
-
-    def __repr__(self):
-        return 'RavenValue(RVN: {}, ASSETS: {})'.format(self.__rvn_value, {k: v.__str__() for k, v in self.__asset_value.items()})
-
-    def __add__(self, other):
-        if isinstance(other, RavenValue):
-            v_r = self.rvn_value + other.rvn_value
-            v_a = self.assets
-            for k, v in other.assets.items():
-                if k in v_a:
-                    v_a[k] += v
-                else:
-                    v_a[k] = v
-            return RavenValue(v_r, v_a)
-        else:
-            raise ValueError('RavenValue required')
-
-    def __sub__(self, other):
-        if isinstance(other, RavenValue):
-            v_r = self.rvn_value - other.rvn_value
-            v_a = self.assets
-            for k, v in other.assets.items():
-                if k in v_a:
-                    v_a[k] -= v
-                    if v_a[k] == 0:
-                        del v_a[k]
-                else:
-                    v_a[k] = -v
-            return RavenValue(v_r, v_a)
-        else:
-            raise ValueError('RavenValue required')
-
-    def __mul__(self, other):
-        if isinstance(other, int):
-            self.__rvn_value *= other
-            for asset, val in self.assets:
-                self.__asset_value[asset] = val * other
-        else:
-            raise ValueError('int required')
-
-    def __eq__(self, other):
-        if not isinstance(other, RavenValue):
-            return False
-        return self.__rvn_value == other.__rvn_value and self.__asset_value == other.__asset_value
-
-    def __hash__(self):
-        k1 = hash(self.__rvn_value)
-        k2 = hash(frozenset(self.__asset_value.items()))
-        return int((k1 + k2) * (k1 + k2 + 1) / 2 + k2)
-
-    def __lt__(self, other):
-        if isinstance(other, RavenValue):
-            o_a = other.assets
-            if len(self.__asset_value) == 0 and len(o_a) != 0:
-                return True
-            if self.__rvn_value >= other.__rvn_value:
-                return False
-            for asset, amt in self.__asset_value.items():
-                if asset not in o_a:
-                    return False
-                if amt >= o_a[asset]:
-                    return False
-            return True
-        else:
-            raise ValueError('RavenValue required')
-
-    def __copy__(self):
-        return RavenValue(self.__rvn_value, self.__asset_value)
-
-    def __deepcopy__(self, memo):
-        cls = self.__class__
-        result = cls.__new__(cls)
-        memo[id(self)] = result
-        for k, v in self.__dict__.items():
-            setattr(result, k, copy.deepcopy(v))
-        return result
-
-    def to_json(self):
-        d = {
-            'RVN': self.rvn_value.value,
-            'ASSETS': {k: v.value for k, v in self.assets.items()},
-        }
-        return d
-
-    def is_incoming(self):
-        # 0 >= if receiving assets or RVN
-        # <0 for the fee spent
-        return self.rvn_value >= 0
+    @classmethod
+    def is_valid(cls, sighash) -> bool:
+        for flag in Sighash:
+            for base_flag in [Sighash.ALL, Sighash.NONE, Sighash.SINGLE]:
+                if (flag & ~0x1f | base_flag) == sighash:
+                    return True
+        return False
 
 
 class TxOutput:
     scriptpubkey: bytes
-    _value: Satoshis
-    asset: Union[str, None]
-    max: bool  # This is just a cosmetic check and has no real effect on the actual value
+    value: Union[int, str]
 
-    def __init__(self, *, scriptpubkey: bytes, value: Satoshis, is_max: bool = False, asset: str = None):
-        assert isinstance(scriptpubkey, bytes)
-        assert isinstance(value, Satoshis) or isinstance(value, int)
-        if isinstance(value, int):
-            value = Satoshis(value)
+    def __init__(self, *, scriptpubkey: bytes, value: Union[int, str]):
         self.scriptpubkey = scriptpubkey
-        self._value = value
-        self.asset = asset
-        self.max = is_max
-
-    @property
-    def value(self):
-        return self._value
-
-    @value.setter
-    def value(self, value):
-        assert isinstance(value, Satoshis)
-        self._value = value
+        if not (isinstance(value, int) or parse_max_spend(value) is not None):
+            raise ValueError(f"bad txout value: {value!r}")
+        self.value = value  # int in satoshis; or spend-max-like str
 
     @classmethod
-    def from_address_and_value(cls, address: str, value: Satoshis, asset: str = None, *, is_max = False) -> Union['TxOutput', 'PartialTxOutput']:
-        script = bfh(ravencoin.address_to_script(address))
-        if asset:
-            script = assets.create_transfer_asset_script(script, asset, value.value)
-
-        return cls(scriptpubkey=script,
-                   value=value,
-                   asset=asset,
-                   is_max=is_max)
+    def from_address_and_value(cls, address: str, value: Union[int, str]) -> Union['TxOutput', 'PartialTxOutput']:
+        return cls(scriptpubkey=bfh(bitcoin.address_to_script(address)),
+                   value=value)
 
     def serialize_to_network(self) -> bytes:
-        if self.asset:
-            buf = bytes(8)
-        else:
-            buf = self.value.to_bytes(8, byteorder="little", signed=False)
+        buf = int.to_bytes(self.value, 8, byteorder="little", signed=False)
         script = self.scriptpubkey
         buf += bfh(var_int(len(script.hex()) // 2))
         buf += script
@@ -268,38 +134,18 @@ class TxOutput:
             raise SerializationError('extra junk at the end of TxOutput bytes')
         return txout
 
-    def to_legacy_tuple(self) -> Tuple[int, str, RavenValue]:
-        if self.asset:
-            value = RavenValue(0, {self.asset: self.value})
-        else:
-            value = RavenValue(self.value)
+    def to_legacy_tuple(self) -> Tuple[int, str, Union[int, str]]:
         if self.address:
-            return TYPE_ADDRESS, self.address, value
-        return TYPE_SCRIPT, self.scriptpubkey.hex(), value
+            return TYPE_ADDRESS, self.address, self.value
+        return TYPE_SCRIPT, self.scriptpubkey.hex(), self.value
 
     @classmethod
-    def from_legacy_tuple(cls, _type: int, addr: str, val) -> Union['TxOutput', 'PartialTxOutput']:
-
-        if isinstance(val, Dict):
-            val = RavenValue.from_json(val)
-        if isinstance(val, int):
-            val = RavenValue(val)
-
-        asset_d = val.assets
-        asset = None
-        if asset_d:
-            asset, value = list(val.assets.items())[0]
-        else:
-            value = val.rvn_value
-
+    def from_legacy_tuple(cls, _type: int, addr: str, val: Union[int, str]) -> Union['TxOutput', 'PartialTxOutput']:
         if _type == TYPE_ADDRESS:
-            return cls.from_address_and_value(addr, value, asset)
+            return cls.from_address_and_value(addr, val)
         if _type == TYPE_SCRIPT:
-            script = bfh(addr)
-            if asset:
-                script = assets.create_transfer_asset_script(script, asset, value)
-            return cls(scriptpubkey=script, value=value, is_max=False, asset=asset)
-        raise Exception(f"unexptected legacy address type: {_type}")
+            return cls(scriptpubkey=bfh(addr), value=val)
+        raise Exception(f"unexpected legacy address type: {_type}")
 
     @property
     def address(self) -> Optional[str]:
@@ -312,7 +158,7 @@ class TxOutput:
         return f"SCRIPT {self.scriptpubkey.hex()}"
 
     def __repr__(self):
-        return f"<TxOutput script={self.scriptpubkey.hex()} address={self.address} asset={self.asset} value={self.value}>"
+        return f"<TxOutput script={self.scriptpubkey.hex()} address={self.address} value={self.value}>"
 
     def __eq__(self, other):
         if not isinstance(other, TxOutput):
@@ -323,14 +169,10 @@ class TxOutput:
         return not (self == other)
 
     def to_json(self):
-        if self.asset:
-            value = RavenValue(0, {self.asset: self.value})
-        else:
-            value = RavenValue(self.value)
         d = {
             'scriptpubkey': self.scriptpubkey.hex(),
             'address': self.address,
-            'value_sats': value
+            'value_sats': self.value,
         }
         return d
 
@@ -365,41 +207,24 @@ class TxOutpoint(NamedTuple):
         return self.txid == bytes(32)
 
 
-class AssetMeta(NamedTuple):
-    name: str
-    circulation: int
-    is_owner: bool
-    is_reissuable: bool
-    divisions: int
-    has_ipfs: bool
-    ipfs_str: Optional[str]
-    height: int
-    source_type: str  #q, r, o
-    source_outpoint: TxOutpoint
-    source_prev_outpoint: Optional[TxOutpoint]
-
-
 class TxInput:
     prevout: TxOutpoint
     script_sig: Optional[bytes]
     nsequence: int
     witness: Optional[bytes]
     _is_coinbase_output: bool
-    sighash: Optional[int]
 
     def __init__(self, *,
                  prevout: TxOutpoint,
                  script_sig: bytes = None,
                  nsequence: int = 0xffffffff - 1,
                  witness: bytes = None,
-                 is_coinbase_output: bool = False,
-                 sighash: Optional[int] = None):
+                 is_coinbase_output: bool = False):
         self.prevout = prevout
         self.script_sig = script_sig
         self.nsequence = nsequence
         self.witness = witness
         self._is_coinbase_output = is_coinbase_output
-        self.sighash = sighash
 
     def is_coinbase_input(self) -> bool:
         """Whether this is the input of a coinbase tx."""
@@ -411,7 +236,7 @@ class TxInput:
         """
         return self._is_coinbase_output
 
-    def value_sats(self) -> Optional[RavenValue]:
+    def value_sats(self) -> Optional[int]:
         return None
 
     def to_json(self):
@@ -427,7 +252,7 @@ class TxInput:
             d['witness'] = self.witness.hex()
         return d
 
-    def witness_elements(self) -> Sequence[bytes]:
+    def witness_elements(self)-> Sequence[bytes]:
         vds = BCDataStream()
         vds.write(self.witness)
         n = vds.read_compact_size()
@@ -606,9 +431,24 @@ class OPPushDataGeneric:
                or (isinstance(item, type) and issubclass(item, cls))
 
 
-OPPushDataPubkey = OPPushDataGeneric(lambda x: x in (33, 65))
+class OPGeneric:
+    def __init__(self, matcher: Callable=None):
+        if matcher is not None:
+            self.matcher = matcher
 
-SCRIPTPUBKEY_TEMPLATE_P2PK = [OPPushDataGeneric(lambda x: x in (33, 65)), opcodes.OP_CHECKSIG]
+    def match(self, op) -> bool:
+        return self.matcher(op)
+
+    @classmethod
+    def is_instance(cls, item):
+        # accept objects that are instances of this class
+        # or other classes that are subclasses
+        return isinstance(item, cls) \
+               or (isinstance(item, type) and issubclass(item, cls))
+
+OPPushDataPubkey = OPPushDataGeneric(lambda x: x in (33, 65))
+OP_ANYSEGWIT_VERSION = OPGeneric(lambda x: x in list(range(opcodes.OP_1, opcodes.OP_16 + 1)))
+
 SCRIPTPUBKEY_TEMPLATE_P2PKH = [opcodes.OP_DUP, opcodes.OP_HASH160,
                                OPPushDataGeneric(lambda x: x == 20),
                                opcodes.OP_EQUALVERIFY, opcodes.OP_CHECKSIG]
@@ -616,6 +456,22 @@ SCRIPTPUBKEY_TEMPLATE_P2SH = [opcodes.OP_HASH160, OPPushDataGeneric(lambda x: x 
 SCRIPTPUBKEY_TEMPLATE_WITNESS_V0 = [opcodes.OP_0, OPPushDataGeneric(lambda x: x in (20, 32))]
 SCRIPTPUBKEY_TEMPLATE_P2WPKH = [opcodes.OP_0, OPPushDataGeneric(lambda x: x == 20)]
 SCRIPTPUBKEY_TEMPLATE_P2WSH = [opcodes.OP_0, OPPushDataGeneric(lambda x: x == 32)]
+SCRIPTPUBKEY_TEMPLATE_ANYSEGWIT = [OP_ANYSEGWIT_VERSION, OPPushDataGeneric(lambda x: x in list(range(2, 40 + 1)))]
+
+
+def check_scriptpubkey_template_and_dust(scriptpubkey, amount: Optional[int]):
+    if match_script_against_template(scriptpubkey, SCRIPTPUBKEY_TEMPLATE_P2PKH):
+        dust_limit = bitcoin.DUST_LIMIT_P2PKH
+    elif match_script_against_template(scriptpubkey, SCRIPTPUBKEY_TEMPLATE_P2SH):
+        dust_limit = bitcoin.DUST_LIMIT_P2SH
+    elif match_script_against_template(scriptpubkey, SCRIPTPUBKEY_TEMPLATE_P2WSH):
+        dust_limit = bitcoin.DUST_LIMIT_P2WSH
+    elif match_script_against_template(scriptpubkey, SCRIPTPUBKEY_TEMPLATE_P2WPKH):
+        dust_limit = bitcoin.DUST_LIMIT_P2WPKH
+    else:
+        raise Exception(f'scriptpubkey does not conform to any template: {scriptpubkey.hex()}')
+    if amount < dust_limit:
+        raise Exception(f'amount ({amount}) is below dust limit for scriptpubkey type ({dust_limit})')
 
 
 def match_script_against_template(script, template) -> bool:
@@ -635,10 +491,11 @@ def match_script_against_template(script, template) -> bool:
         script_item = script[i]
         if OPPushDataGeneric.is_instance(template_item) and template_item.check_data_len(script_item[0]):
             continue
+        if OPGeneric.is_instance(template_item) and template_item.match(script_item[0]):
+            continue
         if template_item != script_item[0]:
             return False
     return True
-
 
 def get_script_type_from_output_script(_bytes: bytes) -> Optional[str]:
     if _bytes is None:
@@ -657,85 +514,11 @@ def get_script_type_from_output_script(_bytes: bytes) -> Optional[str]:
         return 'p2wsh'
     return None
 
-
-def is_output_script_p2pk(_bytes: bytes) -> bool:
-    try:
-        raw_decoded = [x for x in script_GetOp(_bytes)]
-    except MalformedBitcoinScript:
-        return False
-
-    decoded = []
-    for tup in raw_decoded:
-        if tup[0] == opcodes.OP_RVN_ASSET:
-            break
-        decoded.append(tup)
-
-    # p2pk (deprecated)
-    if match_script_against_template(decoded, SCRIPTPUBKEY_TEMPLATE_P2PK):
-        return True
-    return False
-
-
-def is_asset_output_script_malformed(_bytes: bytes) -> bool:
-    try:
-        raw_decoded = [x for x in script_GetOp(_bytes)]
-    except MalformedBitcoinScript:
-        return True
-
-    decoded = []
-    record = False
-    for tup in raw_decoded:
-        if tup[0] == opcodes.OP_RVN_ASSET:
-            record = True
-        if record:
-            decoded.append(tup)
-
-    asset_portion = BCDataStream()
-    try:
-        asset_portion.write(decoded[1][1])
-        assert asset_portion.read_bytes(3) == b'rvn'
-        script_type = asset_portion.read_bytes(1)
-        asset_name_len = asset_portion.read_bytes(1)[0]
-        asset_name = asset_portion.read_bytes(asset_name_len)
-        assert len(asset_name) == asset_name_len
-        if script_type != b'o':
-            asset_portion.read_int64()
-            if script_type == b'q':
-                if asset_portion.read_bytes(3)[2] == 1:
-                    asset_portion.read_bytes(34)
-            elif script_type == b'r':
-                asset_portion.read_bytes(2)
-                if asset_portion.can_read_more():
-                    asset_portion.read_bytes(34)
-            elif script_type == b't':
-                if asset_portion.can_read_more():
-                    asset_portion.read_bytes(34)
-            else:
-                return True
-        if asset_portion.can_read_more():
-            return True
-    except:
-        return True
-    return False
-
-
 def get_address_from_output_script(_bytes: bytes, *, net=None) -> Optional[str]:
     try:
-        raw_decoded = [x for x in script_GetOp(_bytes)]
+        decoded = [x for x in script_GetOp(_bytes)]
     except MalformedBitcoinScript:
         return None
-
-    decoded = []
-    for tup in raw_decoded:
-        if tup[0] == opcodes.OP_RVN_ASSET:
-            break
-        decoded.append(tup)
-
-    # p2pk (deprecated)
-    if match_script_against_template(decoded, SCRIPTPUBKEY_TEMPLATE_P2PK):
-        pubkey_bytes = decoded[0][1]
-        h160 = hash_160(pubkey_bytes)
-        return hash160_to_p2pkh(h160, net=net)
 
     # p2pkh
     if match_script_against_template(decoded, SCRIPTPUBKEY_TEMPLATE_P2PKH):
@@ -765,17 +548,7 @@ def parse_input(vds: BCDataStream) -> TxInput:
     prevout = TxOutpoint(txid=prevout_hash, out_idx=prevout_n)
     script_sig = vds.read_bytes(vds.read_compact_size())
     nsequence = vds.read_uint32()
-
-    # Calculate the sig hash type
-
-    sigtype = None
-    try:
-        # Theoretically the script_sig is the very end of the first stack push
-        sigtype = next(iter(script_GetOp(script_sig)))[1][-1]
-    except:
-        pass
-
-    return TxInput(prevout=prevout, script_sig=script_sig, nsequence=nsequence, sighash=sigtype)
+    return TxInput(prevout=prevout, script_sig=script_sig, nsequence=nsequence)
 
 
 def parse_witness(vds: BCDataStream, txin: TxInput) -> None:
@@ -784,51 +557,14 @@ def parse_witness(vds: BCDataStream, txin: TxInput) -> None:
     txin.witness = bfh(construct_witness(witness_elements))
 
 
-def get_assets_from_script(script: bytes) -> Dict[str, int]:
-
-    # TODO: Generalize
-
-    def search_for_rvn(b: bytes, start: int) -> int:
-        index = -1
-        if b[start:start+3] == b'rvn':
-            index = start+3
-        elif b[start+1:start+4] == b'rvn':
-            index = start+4
-        return index
-
-    if script[0] == 0xA9 and script[1] == 0x14 and script[22] == 0x87:  # Script hash
-        index = search_for_rvn(script, 25)
-    else:  # Assumed Pubkey hash
-        index = search_for_rvn(script, 27)
-
-    if index > 0:
-        type = script[index]
-        asset_name_len = script[index+1]
-        asset_name = script[index+2:index+2+asset_name_len]
-        if type != b'o'[0]:
-            sat_amt = int.from_bytes(script[index+2+asset_name_len:index+10+asset_name_len], byteorder='little')
-        else:  # Give a value of '1' to ownership tokens
-            sat_amt = 100_000_000
-        name = asset_name.decode('ascii')
-        return {name: sat_amt}
-    else:
-        return {}
-
-
 def parse_output(vds: BCDataStream) -> TxOutput:
     value = vds.read_int64()
     if value > TOTAL_COIN_SUPPLY_LIMIT_IN_BTC * COIN:
         raise SerializationError('invalid output amount (too large)')
     if value < 0:
         raise SerializationError('invalid output amount (negative)')
-    value = Satoshis(value)
     scriptpubkey = vds.read_bytes(vds.read_compact_size())
-    assets = get_assets_from_script(scriptpubkey)
-    asset = None
-    if assets:
-        asset, value = list(assets.items())[0]
-
-    return TxOutput(value=value, asset=asset, is_max=False, scriptpubkey=scriptpubkey)
+    return TxOutput(value=value, scriptpubkey=scriptpubkey)
 
 
 # pay & redeem scripts
@@ -839,25 +575,15 @@ def multisig_script(public_keys: Sequence[str], m: int) -> str:
     return construct_script([m, *public_keys, n, opcodes.OP_CHECKMULTISIG])
 
 
+
+
 class Transaction:
     _cached_network_ser: Optional[str]
 
     def __str__(self):
         return self.serialize()
 
-    def __deepcopy__(self, memo):
-        cls = self.__class__
-        result = cls.__new__(cls)
-        memo[id(self)] = result
-        for k, v in self.__dict__.items():
-            if k != '_wallet':
-                setattr(result, k, copy.deepcopy(v))
-            else:
-                setattr(result, k, v)
-        return result
-
-    def __init__(self, raw, wallet: 'Abstract_Wallet' = None):
-        self._wallet = wallet
+    def __init__(self, raw):
         if raw is None:
             self._cached_network_ser = None
         elif isinstance(raw, str):
@@ -1021,8 +747,6 @@ class Transaction:
 
     @classmethod
     def input_script(self, txin: TxInput, *, estimate_size=False) -> str:
-        # This is for the hashs; don't need to calculate asset outs here
-
         if txin.script_sig is not None:
             return txin.script_sig.hex()
         if txin.is_coinbase_input():
@@ -1039,66 +763,50 @@ class Transaction:
         if _type in ('address', 'unknown') and estimate_size:
             _type = self.guess_txintype_from_address(txin.address)
         if _type == 'p2pk':
-            script = construct_script([sig_list[0]])
+            return construct_script([sig_list[0]])
         elif _type == 'p2sh':
             # put op_0 before script
             redeem_script = multisig_script(pubkeys, txin.num_sig)
-            script =  construct_script([0, *sig_list, redeem_script])
+            return construct_script([0, *sig_list, redeem_script])
         elif _type == 'p2pkh':
-            script = construct_script([sig_list[0], pubkeys[0]])
+            return construct_script([sig_list[0], pubkeys[0]])
         elif _type in ['p2wpkh', 'p2wsh']:
-            script = ''
+            return ''
         elif _type == 'p2wpkh-p2sh':
-            raise NotImplementedError()
-            redeem_script = ravencoin.p2wpkh_nested_script(pubkeys[0])
-            script = construct_script([redeem_script])
+            redeem_script = bitcoin.p2wpkh_nested_script(pubkeys[0])
+            return construct_script([redeem_script])
         elif _type == 'p2wsh-p2sh':
-            raise NotImplementedError()
             if estimate_size:
                 witness_script = ''
             else:
                 witness_script = self.get_preimage_script(txin)
-            redeem_script = ravencoin.p2wsh_nested_script(witness_script)
-            script = construct_script([redeem_script])
-        else:
-            raise UnknownTxinType(f'cannot construct scriptSig for txin_type: {_type}')
-
-        return script
+            redeem_script = bitcoin.p2wsh_nested_script(witness_script)
+            return construct_script([redeem_script])
+        raise UnknownTxinType(f'cannot construct scriptSig for txin_type: {_type}')
 
     @classmethod
-    def get_preimage_script(cls, txin: 'PartialTxInput', wallet: 'Abstract_Wallet' = None) -> str:
+    def get_preimage_script(cls, txin: 'PartialTxInput') -> str:
         if txin.witness_script:
             if opcodes.OP_CODESEPARATOR in [x[0] for x in script_GetOp(txin.witness_script)]:
                 raise Exception('OP_CODESEPARATOR black magic is not supported')
-            raise NotImplementedError()
-            # return txin.witness_script.hex()
+            return txin.witness_script.hex()
         if not txin.is_segwit() and txin.redeem_script:
             if opcodes.OP_CODESEPARATOR in [x[0] for x in script_GetOp(txin.redeem_script)]:
                 raise Exception('OP_CODESEPARATOR black magic is not supported')
-            raise NotImplementedError()
-            #return txin.redeem_script.hex()
+            return txin.redeem_script.hex()
 
         pubkeys = [pk.hex() for pk in txin.pubkeys]
         if txin.script_type in ['p2sh', 'p2wsh', 'p2wsh-p2sh']:
-            script = multisig_script(pubkeys, txin.num_sig)
+            return multisig_script(pubkeys, txin.num_sig)
         elif txin.script_type in ['p2pkh', 'p2wpkh', 'p2wpkh-p2sh']:
             pubkey = pubkeys[0]
             pkh = bh2u(hash_160(bfh(pubkey)))
-            script = ravencoin.pubkeyhash_to_p2pkh_script(pkh)
+            return bitcoin.pubkeyhash_to_p2pkh_script(pkh)
         elif txin.script_type == 'p2pk':
             pubkey = pubkeys[0]
-            script = ravencoin.public_key_to_p2pk_script(pubkey)
+            return bitcoin.public_key_to_p2pk_script(pubkey)
         else:
             raise UnknownTxinType(f'cannot construct preimage_script for txin_type: {txin.script_type}')
-
-        a = txin.value_sats().assets
-        if a:
-            asset, amt = list(a.items())[0]
-            script = guess_asset_script_for_vin(bfh(script), asset, amt, txin, wallet)
-
-        script = wallet.get_nonstandard_outpoints().get(txin.prevout.to_str(), script)
-
-        return script
 
     @classmethod
     def serialize_input(self, txin: TxInput, script: str) -> str:
@@ -1234,15 +942,8 @@ class Transaction:
     @classmethod
     def estimated_output_size_for_address(cls, address: str) -> int:
         """Return an estimate of serialized output size in bytes."""
-        script = ravencoin.address_to_script(address)
+        script = bitcoin.address_to_script(address)
         return cls.estimated_output_size_for_script(script)
-
-    @classmethod
-    def estimated_output_size_for_address_with_asset(cls, address: str, asset: str) -> int:
-        """Return an estimate of serialized output size in bytes."""
-        script = ravencoin.address_to_script(address)
-        est_raw = cls.estimated_output_size_for_script(script)
-        return est_raw + 1 + 1 + 3 + 1 + 1 + len(asset) + 8 + 1
 
     @classmethod
     def estimated_output_size_for_script(cls, script: str) -> int:
@@ -1307,7 +1008,7 @@ class Transaction:
         return set(self._script_to_output_idx[script])  # copy
 
     def get_output_idxs_from_address(self, addr: str) -> Set[int]:
-        script = ravencoin.address_to_script(addr)
+        script = bitcoin.address_to_script(addr)
         return self.get_output_idxs_from_scriptpubkey(script)
 
     def output_value_for_address(self, addr):
@@ -1494,6 +1195,7 @@ class PartialTxInput(TxInput, PSBTSection):
         self._utxo = None  # type: Optional[Transaction]
         self._witness_utxo = None  # type: Optional[TxOutput]
         self.part_sigs = {}  # type: Dict[bytes, bytes]  # pubkey -> sig
+        self.sighash = None  # type: Optional[int]
         self.bip32_paths = {}  # type: Dict[bytes, Tuple[bytes, Sequence[int]]]  # pubkey -> (xpub_fingerprint, path)
         self.redeem_script = None  # type: Optional[bytes]
         self.witness_script = None  # type: Optional[bytes]
@@ -1502,21 +1204,12 @@ class PartialTxInput(TxInput, PSBTSection):
         self.script_type = 'unknown'
         self.num_sig = 0  # type: int  # num req sigs for multisig
         self.pubkeys = []  # type: List[bytes]  # note: order matters
-        self.__trusted_value_sats = None  # type: Optional[RavenValue]
+        self._trusted_value_sats = None  # type: Optional[int]
         self._trusted_address = None  # type: Optional[str]
         self.block_height = None  # type: Optional[int]  # height at which the TXO is mined; None means unknown
         self.spent_height = None  # type: Optional[int]  # height at which the TXO got spent
         self._is_p2sh_segwit = None  # type: Optional[bool]  # None means unknown
         self._is_native_segwit = None  # type: Optional[bool]  # None means unknown
-
-    @property
-    def _trusted_value_sats(self):
-        return self.__trusted_value_sats
-
-    @_trusted_value_sats.setter
-    def _trusted_value_sats(self, v):
-        assert isinstance(v, RavenValue)
-        self.__trusted_value_sats = v
 
     @property
     def utxo(self):
@@ -1574,8 +1267,7 @@ class PartialTxInput(TxInput, PSBTSection):
                              script_sig=None if strip_witness else txin.script_sig,
                              nsequence=txin.nsequence,
                              witness=None if strip_witness else txin.witness,
-                             is_coinbase_output=txin.is_coinbase_output(),
-                             sighash=txin.sighash)
+                             is_coinbase_output=txin.is_coinbase_output())
         return res
 
     def validate_data(self, *, for_signing=False) -> None:
@@ -1601,11 +1293,11 @@ class PartialTxInput(TxInput, PSBTSection):
                                                   f"If a redeemScript is provided, the scriptPubKey must be for that redeemScript")
         if self.witness_script:
             if self.redeem_script:
-                if self.redeem_script != bfh(ravencoin.p2wsh_nested_script(self.witness_script.hex())):
+                if self.redeem_script != bfh(bitcoin.p2wsh_nested_script(self.witness_script.hex())):
                     raise PSBTInputConsistencyFailure(f"PSBT input validation: "
                                                       f"If a witnessScript is provided, the redeemScript must be for that witnessScript")
             elif self.address:
-                if self.address != ravencoin.script_to_p2wsh(self.witness_script.hex()):
+                if self.address != bitcoin.script_to_p2wsh(self.witness_script.hex()):
                     raise PSBTInputConsistencyFailure(f"PSBT input validation: "
                                                       f"If a witnessScript is provided, the scriptPubKey must be for that witnessScript")
 
@@ -1696,24 +1388,14 @@ class PartialTxInput(TxInput, PSBTSection):
             key_type, key = self.get_keytype_and_key_from_fullkey(full_key)
             wr(key_type, val, key=key)
 
-    def value_sats(self) -> Optional[RavenValue]:
+    def value_sats(self) -> Optional[int]:
         if self._trusted_value_sats is not None:
             return self._trusted_value_sats
         if self.utxo:
             out_idx = self.prevout.out_idx
-            outpoint = self.utxo.outputs()[out_idx]
-            if outpoint.asset:
-                value = RavenValue(0, {outpoint.asset: outpoint.value})
-            else:
-                value = RavenValue(outpoint.value)
-            return value
+            return self.utxo.outputs()[out_idx].value
         if self.witness_utxo:
-            outpoint = self.witness_utxo
-            if outpoint.asset:
-                value = RavenValue(0, {outpoint.asset: outpoint.value})
-            else:
-                value = RavenValue(outpoint.value)
-            return value
+            return self.witness_utxo.value
         return None
 
     @property
@@ -1728,12 +1410,7 @@ class PartialTxInput(TxInput, PSBTSection):
     @property
     def scriptpubkey(self) -> Optional[bytes]:
         if self._trusted_address is not None:
-            a = self.value_sats().assets
-            script = bfh(ravencoin.address_to_script(self._trusted_address))
-            #if a:
-            #    asset, amt = list(a.items())[0]
-            #    script = assets.create_transfer_asset_script(script, asset, amt)
-            return script
+            return bfh(bitcoin.address_to_script(self._trusted_address))
         if self.utxo:
             out_idx = self.prevout.out_idx
             return self.utxo.outputs()[out_idx].scriptpubkey
@@ -1834,7 +1511,7 @@ class PartialTxInput(TxInput, PSBTSection):
         """Whether this input is native segwit. None means inconclusive."""
         if self._is_native_segwit is None:
             if self.address:
-                self._is_native_segwit = ravencoin.is_segwit_address(self.address)
+                self._is_native_segwit = bitcoin.is_segwit_address(self.address)
         return self._is_native_segwit
 
     def is_p2sh_segwit(self) -> Optional[bool]:
@@ -1843,7 +1520,7 @@ class PartialTxInput(TxInput, PSBTSection):
             def calc_if_p2sh_segwit_now():
                 if not (self.address and self.redeem_script):
                     return None
-                if self.address != ravencoin.hash160_to_p2sh(hash_160(self.redeem_script)):
+                if self.address != bitcoin.hash160_to_p2sh(hash_160(self.redeem_script)):
                     # not p2sh address
                     return False
                 try:
@@ -1913,9 +1590,7 @@ class PartialTxOutput(TxOutput, PSBTSection):
     @classmethod
     def from_txout(cls, txout: TxOutput) -> 'PartialTxOutput':
         res = PartialTxOutput(scriptpubkey=txout.scriptpubkey,
-                              value=txout.value,
-                              asset=txout.asset,
-                              is_max=txout.max)
+                              value=txout.value)
         return res
 
     def parse_psbt_section_kv(self, kt, key, val):
@@ -2096,17 +1771,17 @@ class PartialTransaction(Transaction):
         return tx
 
     @classmethod
-    def from_io(cls, inputs: Sequence[PartialTxInput], outputs: Sequence[PartialTxOutput], *, wallet = None,
-                locktime: int = None, version: int = None):
+    def from_io(cls, inputs: Sequence[PartialTxInput], outputs: Sequence[PartialTxOutput], *,
+                locktime: int = None, version: int = None, BIP69_sort: bool = True):
         self = cls()
         self._inputs = list(inputs)
         self._outputs = list(outputs)
-        self._wallet = wallet
         if locktime is not None:
             self.locktime = locktime
         if version is not None:
             self.version = version
-        self.BIP69_sort()
+        if BIP69_sort:
+            self.BIP69_sort()
         return self
 
     def _serialize_psbt(self, fd) -> None:
@@ -2201,61 +1876,18 @@ class PartialTransaction(Transaction):
             self._inputs.sort(key = lambda i: (i.prevout.txid, i.prevout.out_idx))
         if outputs:
             self._outputs.sort(key = lambda o: (o.value, o.scriptpubkey))
-
-            # Assets need a certain order:
-            # Burn, {whatever}, parent, new owner, new
-            burn_vout = None
-            parent_owner_vout = None
-            asset_owner_vout = None
-            asset_create_vout = None
-            for o in iter(self._outputs):
-                if o.address in constants.net.BURN_ADDRESSES:
-                    burn_vout = o
-                elif o.asset:
-                    asset = o.asset
-                    if asset[-1] == '!':
-                        if asset_create_vout:
-                            # We know what the asset owner looks like
-                            if asset[:-1] == asset_create_vout.asset:
-                                t = asset_owner_vout
-                                asset_owner_vout = o
-                                if not parent_owner_vout:
-                                    parent_owner_vout = t
-                            else:
-                                parent_owner_vout = o
-                        else:
-                            # Just put it somewhere
-                            if asset_owner_vout:
-                                parent_owner_vout = o
-                            else:
-                                asset_owner_vout = o
-                    else:
-                        asset_create_vout = o
-                        if asset_owner_vout and asset_owner_vout.asset[:-1] != asset:
-                            # Swap asset owner and parent owner positions
-                            t = parent_owner_vout
-                            parent_owner_vout = asset_owner_vout
-                            asset_owner_vout = t
-            if burn_vout and asset_create_vout:
-                new_outs = [o for o in self._outputs if o not in (burn_vout, parent_owner_vout, asset_owner_vout, asset_create_vout)]
-
-                self._outputs = [burn_vout] + new_outs + \
-                                ([parent_owner_vout] if parent_owner_vout else []) + \
-                                ([asset_owner_vout] if asset_owner_vout else []) + \
-                                [asset_create_vout]
         self.invalidate_ser_cache()
 
-    def input_value(self) -> RavenValue:
+    def input_value(self) -> int:
         input_values = [txin.value_sats() for txin in self.inputs()]
         if any([val is None for val in input_values]):
             raise MissingTxInputAmount()
-        return sum(input_values, RavenValue())
+        return sum(input_values)
 
-    def output_value(self) -> RavenValue:
-        return \
-            sum([RavenValue(0, {x.asset: x.value}) if x.asset else RavenValue(x.value) for x in self.outputs()], RavenValue())
+    def output_value(self) -> int:
+        return sum(o.value for o in self.outputs())
 
-    def get_fee(self) -> Optional[RavenValue]:
+    def get_fee(self) -> Optional[int]:
         try:
             return self.input_value() - self.output_value()
         except MissingTxInputAmount:
@@ -2268,24 +1900,33 @@ class PartialTransaction(Transaction):
         inputs = self.inputs()
         outputs = self.outputs()
         txin = inputs[txin_index]
-        sighash = txin.sighash if txin.sighash is not None else SIGHASH.ALL
-        if sighash not in list(map(int, SIGHASH)):
-            raise Exception("invalid sighash: {}".format(sighash))
+        sighash = txin.sighash if txin.sighash is not None else Sighash.ALL
+        if not Sighash.is_valid(sighash):
+            raise Exception("SIGHASH_FLAG not supported!")
         nHashType = int_to_hex(sighash, 4)
-        preimage_script = self.get_preimage_script(txin, self._wallet)
-        _logger.info(f"Preimage script for {txin.prevout.txid.hex()}\n{bfh(preimage_script)}")
+        preimage_script = self.get_preimage_script(txin)
         if txin.is_segwit():
-            raise NotImplementedError()
-            #if bip143_shared_txdigest_fields is None:
-            #    bip143_shared_txdigest_fields = self._calc_bip143_shared_txdigest_fields()
-            #hashPrevouts = bip143_shared_txdigest_fields.hashPrevouts
-            #hashSequence = bip143_shared_txdigest_fields.hashSequence
-            #hashOutputs = bip143_shared_txdigest_fields.hashOutputs
-            #outpoint = txin.prevout.serialize_to_network().hex()
-            #scriptCode = var_int(len(preimage_script) // 2) + preimage_script
-            #amount = int_to_hex(txin.value_sats(), 8)
-            #nSequence = int_to_hex(txin.nsequence, 4)
-            #preimage = nVersion + hashPrevouts + hashSequence + outpoint + scriptCode + amount + nSequence + hashOutputs + nLocktime + nHashType
+            if bip143_shared_txdigest_fields is None:
+                bip143_shared_txdigest_fields = self._calc_bip143_shared_txdigest_fields()
+            if not(sighash & Sighash.ANYONECANPAY):
+                hashPrevouts = bip143_shared_txdigest_fields.hashPrevouts
+            else:
+                hashPrevouts = '00' * 32
+            if (not(sighash & Sighash.ANYONECANPAY) and (sighash & 0x1f) != Sighash.SINGLE and (sighash & 0x1f) != Sighash.NONE):
+                hashSequence = bip143_shared_txdigest_fields.hashSequence
+            else:
+                hashSequence = '00' * 32
+            if ((sighash & 0x1f) != Sighash.SINGLE and (sighash & 0x1f) != Sighash.NONE):
+                hashOutputs = bip143_shared_txdigest_fields.hashOutputs
+            elif ((sighash & 0x1f) == Sighash.SINGLE and txin_index < len(outputs)):
+                hashOutputs = bh2u(sha256d(outputs[txin_index].serialize_to_network()))
+            else:
+                hashOutputs = '00' * 32
+            outpoint = txin.prevout.serialize_to_network().hex()
+            scriptCode = var_int(len(preimage_script) // 2) + preimage_script
+            amount = int_to_hex(txin.value_sats(), 8)
+            nSequence = int_to_hex(txin.nsequence, 4)
+            preimage = nVersion + hashPrevouts + hashSequence + outpoint + scriptCode + amount + nSequence + hashOutputs + nLocktime + nHashType
         else:
             txins = var_int(len(inputs)) + ''.join(self.serialize_input(txin, preimage_script if txin_index==k else '')
                                                    for k, txin in enumerate(inputs))
@@ -2311,14 +1952,16 @@ class PartialTransaction(Transaction):
         _logger.debug(f"is_complete {self.is_complete()}")
         self.invalidate_ser_cache()
 
-    def sign_txin(self, txin_index, privkey_bytes, *, bip143_shared_txdigest_fields=None, sighash=SIGHASH.ALL) -> str:
+    def sign_txin(self, txin_index, privkey_bytes, *, bip143_shared_txdigest_fields=None) -> str:
         txin = self.inputs()[txin_index]
         txin.validate_data(for_signing=True)
+        sighash = txin.sighash if txin.sighash is not None else Sighash.ALL
+        sighash_type = sighash.to_bytes(length=1, byteorder="big").hex()
         pre_hash = sha256d(bfh(self.serialize_preimage(txin_index,
                                                        bip143_shared_txdigest_fields=bip143_shared_txdigest_fields)))
         privkey = ecc.ECPrivkey(privkey_bytes)
         sig = privkey.sign_transaction(pre_hash)
-        sig = bh2u(sig) + '{0:02x}'.format(sighash)
+        sig = bh2u(sig) + sighash_type
         return sig
 
     def is_complete(self) -> bool:
@@ -2401,7 +2044,6 @@ class PartialTransaction(Transaction):
         txin.witness = None
         self.invalidate_ser_cache()
 
-    #TODO: Move asset info to here
     def add_info_from_wallet(
             self,
             wallet: 'Abstract_Wallet',

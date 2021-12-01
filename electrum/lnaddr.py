@@ -11,15 +11,13 @@ from typing import Optional, TYPE_CHECKING, Type
 import random
 import bitstring
 
-from electrum.transaction import RavenValue
-from electrum.util import Satoshis
-from .ravencoin import hash160_to_b58_address, b58_address_to_hash160, TOTAL_COIN_SUPPLY_LIMIT_IN_BTC
+from .bitcoin import hash160_to_b58_address, b58_address_to_hash160, TOTAL_COIN_SUPPLY_LIMIT_IN_BTC
 from .segwit_addr import bech32_encode, bech32_decode, CHARSET
 from . import segwit_addr
 from . import constants
 from .constants import AbstractNet
 from . import ecc
-from .ravencoin import COIN
+from .bitcoin import COIN
 
 if TYPE_CHECKING:
     from .lnutil import LnFeatures
@@ -127,12 +125,8 @@ def parse_fallback(fallback, net: Type[AbstractNet]):
     return addr
 
 
-base58_prefix_map = {
-    constants.RavencoinMainnet.SEGWIT_HRP : (constants.RavencoinMainnet.ADDRTYPE_P2PKH, constants.RavencoinMainnet.ADDRTYPE_P2SH),
-    constants.RavencoinTestnet.SEGWIT_HRP : (constants.RavencoinTestnet.ADDRTYPE_P2PKH, constants.RavencoinTestnet.ADDRTYPE_P2SH)
-}
-
 BOLT11_HRP_INV_DICT = {net.BOLT11_HRP: net for net in constants.NETS_LIST}
+
 
 # Tagged field containing BitArray
 def tagged(char, l):
@@ -298,11 +292,11 @@ class LnAddr(object):
             raise LnInvoiceException(f"Cannot encode {value!r}: too many decimal places")
         self._amount = value
 
-    def get_amount_sat(self) -> Optional[RavenValue]:
+    def get_amount_sat(self) -> Optional[Decimal]:
         # note that this has msat resolution potentially
         if self.amount is None:
             return None
-        return RavenValue(Satoshis(self.amount * COIN))
+        return self.amount * COIN
 
     def get_routing_info(self, tag):
         # note: tag will be 't' for trampoline

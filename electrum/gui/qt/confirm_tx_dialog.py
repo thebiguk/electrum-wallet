@@ -22,16 +22,17 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-import logging
+
 from decimal import Decimal
 from typing import TYPE_CHECKING, Optional, Union
 
-from PyQt5.QtWidgets import  QVBoxLayout, QLabel, QGridLayout, QPushButton, QLineEdit
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QVBoxLayout, QLabel, QGridLayout, QPushButton, QLineEdit
 
 from electrum.i18n import _
 from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates
 from electrum.plugin import run_hook
-from electrum.transaction import Transaction, PartialTransaction, RavenValue
+from electrum.transaction import Transaction, PartialTransaction
 from electrum.simple_config import FEERATE_WARNING_HIGH_FEE, FEE_RATIO_HIGH_WARNING
 from electrum.wallet import InternalAddressCorruption
 
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 class TxEditor:
 
     def __init__(self, *, window: 'ElectrumWindow', make_tx,
-                 output_value: RavenValue = None, is_sweep: bool):
+                 output_value: Union[int, str] = None, is_sweep: bool):
         self.main_window = window
         self.make_tx = make_tx
         self.output_value = output_value
@@ -87,7 +88,6 @@ class TxEditor:
             self.not_enough_funds = False
             self.no_dynfee_estimates = False
         except NotEnoughFunds:
-            logging.exception('Not enough funds called update_tx')
             self.not_enough_funds = True
             self.tx = None
             if fallback_to_zero_fee:
@@ -111,7 +111,7 @@ class TxEditor:
             self.tx = None
             self.main_window.show_error(str(e))
             raise
-        use_rbf = bool(self.config.get('use_rbf', False))
+        use_rbf = bool(self.config.get('use_rbf', True))
         self.tx.set_rbf(use_rbf)
 
     def have_enough_funds_assuming_zero_fees(self) -> bool:
@@ -123,10 +123,12 @@ class TxEditor:
             return True
 
 
+
+
 class ConfirmTxDialog(TxEditor, WindowModalDialog):
     # set fee and return password (after pw check)
 
-    def __init__(self, *, window: 'ElectrumWindow', make_tx, output_value: RavenValue, is_sweep: bool):
+    def __init__(self, *, window: 'ElectrumWindow', make_tx, output_value: Union[int, str], is_sweep: bool):
 
         TxEditor.__init__(self, window=window, make_tx=make_tx, output_value=output_value, is_sweep=is_sweep)
         WindowModalDialog.__init__(self, window, _("Confirm Transaction"))
@@ -134,20 +136,26 @@ class ConfirmTxDialog(TxEditor, WindowModalDialog):
         self.setLayout(vbox)
         grid = QGridLayout()
         vbox.addLayout(grid)
+
+        msg = (_('The amount to be received by the recipient.') + ' '
+               + _('Fees are paid by the sender.'))
         self.amount_label = QLabel('')
-        grid.addWidget(QLabel(_("Amount to be sent") + ": "), 0, 0)
+        self.amount_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        grid.addWidget(HelpLabel(_("Amount to be sent") + ": ", msg), 0, 0)
         grid.addWidget(self.amount_label, 0, 1)
 
-        msg = _('Ravencoin transactions are in general not free. A transaction fee is paid by the sender of the funds.') + '\n\n'\
+        msg = _('Bitcoin transactions are in general not free. A transaction fee is paid by the sender of the funds.') + '\n\n'\
               + _('The amount of fee can be decided freely by the sender. However, transactions with low fees take more time to be processed.') + '\n\n'\
               + _('A suggested fee is automatically added to this field. You may override it. The suggested fee increases with the size of the transaction.')
         self.fee_label = QLabel('')
+        self.fee_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         grid.addWidget(HelpLabel(_("Mining fee") + ": ", msg), 1, 0)
         grid.addWidget(self.fee_label, 1, 1)
 
         self.extra_fee_label = QLabel(_("Additional fees") + ": ")
         self.extra_fee_label.setVisible(False)
         self.extra_fee_value = QLabel('')
+        self.extra_fee_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.extra_fee_value.setVisible(False)
         grid.addWidget(self.extra_fee_label, 2, 0)
         grid.addWidget(self.extra_fee_value, 2, 1)
@@ -159,6 +167,7 @@ class ConfirmTxDialog(TxEditor, WindowModalDialog):
         grid.addWidget(self.fee_combo, 5, 2)
 
         self.message_label = QLabel(self.default_message())
+        self.message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         grid.addWidget(self.message_label, 6, 0, 1, -1)
         self.pw_label = QLabel(_('Password'))
         self.pw_label.setVisible(self.password_required)
@@ -212,18 +221,17 @@ class ConfirmTxDialog(TxEditor, WindowModalDialog):
         self.pw.setEnabled(enable)
         self.send_button.setEnabled(enable)
 
-    # TODO: Currently only for RVN
     def _update_amount_label(self):
         tx = self.tx
         if self.output_value == '!':
             if tx:
                 amount = tx.output_value()
-                amount_str = self.main_window.format_amount_and_units(amount.rvn_value)
+                amount_str = self.main_window.format_amount_and_units(amount)
             else:
                 amount_str = "max"
         else:
             amount = self.output_value
-            amount_str = self.main_window.format_amount_and_units(amount.rvn_value)
+            amount_str = self.main_window.format_amount_and_units(amount)
         self.amount_label.setText(amount_str)
 
     def update(self):
@@ -238,7 +246,7 @@ class ConfirmTxDialog(TxEditor, WindowModalDialog):
         if not tx:
             return
 
-        fee = tx.get_fee().rvn_value.value  # Fee will only be rvn
+        fee = tx.get_fee()
         assert fee is not None
         self.fee_label.setText(self.main_window.format_amount_and_units(fee))
         x_fee = run_hook('get_tx_extra_fee', self.wallet, tx)
@@ -248,7 +256,7 @@ class ConfirmTxDialog(TxEditor, WindowModalDialog):
             self.extra_fee_value.setVisible(True)
             self.extra_fee_value.setText(self.main_window.format_amount_and_units(x_fee_amount))
 
-        amount = self.output_value
+        amount = tx.output_value() if self.output_value == '!' else self.output_value
         tx_size = tx.estimated_size()
         fee_warning_tuple = self.wallet.get_tx_fee_warning(
             invoice_amt=amount, tx_size=tx_size, fee=fee)

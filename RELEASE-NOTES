@@ -17,8 +17,6 @@
    could not open the settings (c49d6995)
  * CLI/RPC: fix "close_wallet" command (#7348)
 
-# Release Ravencoin 0.3.0 - (May 21, 2021)
- * Conversion to Ravencoin
 
 # Release 4.1.3 - (June 16, 2021)
  * Builds/binaries:
@@ -39,7 +37,6 @@
    correct bip39 checksum by chance (#6001)
  * other minor fixes
 
->>>>>>> 0b30cf80de3aff6359172372288f537aded60c19
 
 # Release 4.1.2 - (April 8, 2021)
  * Qt GUI:

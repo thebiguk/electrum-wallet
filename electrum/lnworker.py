@@ -31,8 +31,8 @@ from .invoices import PR_TYPE_LN, PR_UNPAID, PR_EXPIRED, PR_PAID, PR_INFLIGHT, P
 from .util import NetworkRetryManager, JsonRPCClient
 from .lnutil import LN_MAX_FUNDING_SAT
 from .keystore import BIP32_KeyStore
-from .ravencoin import COIN
-from .ravencoin import opcodes, make_op_return, address_to_scripthash
+from .bitcoin import COIN
+from .bitcoin import opcodes, make_op_return, address_to_scripthash
 from .transaction import Transaction
 from .transaction import get_script_type_from_output_script
 from .crypto import sha256
@@ -52,7 +52,7 @@ from .lnchannel import ChannelState, PeerState, HTLCWithStatus
 from .lnrater import LNRater
 from . import lnutil
 from .lnutil import funding_output_script
-from .ravencoin import redeem_script_to_address
+from .bitcoin import redeem_script_to_address
 from .lnutil import (Outpoint, LNPeerAddr,
                      get_compressed_pubkey_from_bech32, extract_nodeid,
                      PaymentFailure, split_host_port, ConnStringFormatError,
@@ -175,7 +175,8 @@ LNWALLET_FEATURES = BASE_FEATURES\
     | LnFeatures.OPTION_STATIC_REMOTEKEY_REQ\
     | LnFeatures.GOSSIP_QUERIES_REQ\
     | LnFeatures.BASIC_MPP_OPT\
-    | LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT
+    | LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT\
+    | LnFeatures.OPTION_SHUTDOWN_ANYSEGWIT_OPT\
 
 LNGOSSIP_FEATURES = BASE_FEATURES\
     | LnFeatures.GOSSIP_QUERIES_OPT\
@@ -404,9 +405,9 @@ class LNWorker(Logger, NetworkRetryManager[LNPeerAddr]):
                 return [peer]
 
         # getting desperate... let's try hardcoded fallback list of peers
-        if constants.net in (constants.RavencoinTestnet,):
+        if constants.net in (constants.BitcoinTestnet,):
             fallback_list = FALLBACK_NODE_LIST_TESTNET
-        elif constants.net in (constants.RavencoinMainnet,):
+        elif constants.net in (constants.BitcoinMainnet,):
             fallback_list = FALLBACK_NODE_LIST_MAINNET
         else:
             return []  # regtest??
@@ -646,6 +647,8 @@ class LNWallet(LNWorker):
             self.set_invoice_status(payment_hash.hex(), PR_INFLIGHT)
 
         self.trampoline_forwarding_failures = {} # todo: should be persisted
+        # map forwarded htlcs (fw_info=(scid_hex, htlc_id)) to originating peer pubkeys
+        self.downstream_htlc_to_upstream_peer_map = {}  # type: Dict[Tuple[str, int], bytes]
 
     def has_deterministic_node_id(self):
         return bool(self.db.get('lightning_xprv'))
@@ -1846,8 +1849,23 @@ class LNWallet(LNWorker):
         info = info._replace(status=status)
         self.save_payment_info(info)
 
-    def htlc_fulfilled(self, chan, payment_hash: bytes, htlc_id:int):
-        util.trigger_callback('htlc_fulfilled', payment_hash, chan.channel_id)
+    def _on_maybe_forwarded_htlc_resolved(self, chan: Channel, htlc_id: int) -> None:
+        """Called when an HTLC we offered on chan gets irrevocably fulfilled or failed.
+        If we find this was a forwarded HTLC, the upstream peer is notified.
+        """
+        fw_info = chan.short_channel_id.hex(), htlc_id
+        upstream_peer_pubkey = self.downstream_htlc_to_upstream_peer_map.get(fw_info)
+        if not upstream_peer_pubkey:
+            return
+        upstream_peer = self.peers.get(upstream_peer_pubkey)
+        if not upstream_peer:
+            return
+        upstream_peer.downstream_htlc_resolved_event.set()
+        upstream_peer.downstream_htlc_resolved_event.clear()
+
+    def htlc_fulfilled(self, chan: Channel, payment_hash: bytes, htlc_id: int):
+        util.trigger_callback('htlc_fulfilled', payment_hash, chan, htlc_id)
+        self._on_maybe_forwarded_htlc_resolved(chan=chan, htlc_id=htlc_id)
         q = self.sent_htlcs.get(payment_hash)
         if q:
             route, payment_secret, amount_msat, bucket_msat, amount_receiver_msat = self.sent_htlcs_routes[(payment_hash, chan.short_channel_id, htlc_id)]
@@ -1869,7 +1887,8 @@ class LNWallet(LNWorker):
             error_bytes: Optional[bytes],
             failure_message: Optional['OnionRoutingFailure']):
 
-        util.trigger_callback('htlc_failed', payment_hash, chan.channel_id)
+        util.trigger_callback('htlc_failed', payment_hash, chan, htlc_id)
+        self._on_maybe_forwarded_htlc_resolved(chan=chan, htlc_id=htlc_id)
         q = self.sent_htlcs.get(payment_hash)
         if q:
             # detect if it is part of a bucket
@@ -2096,12 +2115,13 @@ class LNWallet(LNWorker):
 
     def current_feerate_per_kw(self):
         from .simple_config import FEE_LN_ETA_TARGET, FEERATE_FALLBACK_STATIC_FEE, FEERATE_REGTEST_HARDCODED
+        from .simple_config import FEERATE_PER_KW_MIN_RELAY_LIGHTNING
         if constants.net is constants.BitcoinRegtest:
             return FEERATE_REGTEST_HARDCODED // 4
         feerate_per_kvbyte = self.network.config.eta_target_to_fee(FEE_LN_ETA_TARGET)
         if feerate_per_kvbyte is None:
             feerate_per_kvbyte = FEERATE_FALLBACK_STATIC_FEE
-        return max(253, feerate_per_kvbyte // 4)
+        return max(FEERATE_PER_KW_MIN_RELAY_LIGHTNING, feerate_per_kvbyte // 4)
 
     def create_channel_backup(self, channel_id):
         chan = self._channels[channel_id]

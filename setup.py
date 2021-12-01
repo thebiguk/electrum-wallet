@@ -46,8 +46,8 @@ if platform.system() in ['Linux', 'FreeBSD', 'DragonFly']:
         else:
             usr_share = os.path.expanduser('~/.local/share')
     data_files += [
-        (os.path.join(usr_share, 'applications/'), ['electrum-ravencoin.desktop']),
-        (os.path.join(usr_share, icons_dirname), ['electrum/gui/icons/electrum-ravencoin.png']),
+        (os.path.join(usr_share, 'applications/'), ['electrum.desktop']),
+        (os.path.join(usr_share, icons_dirname), ['electrum/gui/icons/electrum.png']),
     ]
 
 extras_require = {
@@ -65,7 +65,7 @@ extras_require['fast'] = extras_require['crypto']
 
 
 setup(
-    name="Electrum-Ravencoin",
+    name="Electrum",
     version=version.ELECTRUM_VERSION,
     python_requires='>={}'.format(MIN_PYTHON_VERSION),
     install_requires=requirements,
@@ -86,12 +86,12 @@ setup(
     # package_data kwarg lists what gets put in site-packages when pip installing the tar.gz.
     # By specifying include_package_data=True, MANIFEST.in becomes responsible for both.
     include_package_data=True,
-    scripts=['electrum/electrum-ravencoin'],
+    scripts=['electrum/electrum'],
     data_files=data_files,
-    description="Lightweight Ravencoin Wallet",
-    author="kralverde",
-    author_email="electrum.raven@gmail.com",
+    description="Lightweight Bitcoin Wallet",
+    author="Thomas Voegtlin",
+    author_email="thomasv@electrum.org",
     license="MIT Licence",
-    url="https://github.com/Electrum-RVN-SIG/electrum-ravencoin",
-    long_description="""Lightweight Ravencoin Wallet""",
+    url="https://electrum.org",
+    long_description="""Lightweight Bitcoin Wallet""",
 )

@@ -21,23 +21,21 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import asyncio
 import threading
 import asyncio
 import itertools
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple, NamedTuple, Sequence, List, Iterable
+from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple, NamedTuple, Sequence, List
 
 from aiorpcx import TaskGroup
 
-from . import ravencoin, util
-from .assets import pull_meta_from_create_or_reissue_script
-from .ravencoin import COINBASE_MATURITY
+from . import bitcoin, util
+from .bitcoin import COINBASE_MATURITY
 from .util import profiler, bfh, TxMinedInfo, UnrelatedTransactionException, with_lock
-from .transaction import Transaction, TxOutput, TxInput, PartialTxInput, TxOutpoint, PartialTransaction, AssetMeta, \
-    RavenValue, is_output_script_p2pk, is_asset_output_script_malformed
+from .transaction import Transaction, TxOutput, TxInput, PartialTxInput, TxOutpoint, PartialTransaction
 from .synchronizer import Synchronizer
 from .verifier import SPV
-
 from .blockchain import hash_header, Blockchain
 from .i18n import _
 from .logging import Logger
@@ -56,16 +54,16 @@ TX_HEIGHT_UNCONFIRMED = 0
 class HistoryItem(NamedTuple):
     txid: str
     tx_mined_status: TxMinedInfo
-    delta: RavenValue
+    delta: int
     fee: Optional[int]
-    balance: RavenValue
+    balance: int
 
 
 class TxWalletDelta(NamedTuple):
     is_relevant: bool  # "related to wallet?"
     is_any_input_ismine: bool
     is_all_input_ismine: bool
-    delta: RavenValue
+    delta: int
     fee: Optional[int]
 
 
@@ -119,18 +117,6 @@ class AddressSynchronizer(Logger):
     def get_addresses(self):
         return sorted(self.db.get_history())
 
-    def get_asset_meta(self, asset) -> AssetMeta:
-        return self.db.get_asset_meta(asset)
-
-    def get_assets(self) -> Iterable[str]:
-        return self.db.get_assets()
-
-    def get_messages(self) -> Dict:
-        return self.db.get_messages()
-
-    def add_message(self, height, message_data):
-        self.db.add_message(height, message_data)
-
     def get_address_history(self, addr: str) -> Sequence[Tuple[str, int]]:
         """Returns the history for the address, in the format that would be returned by a server.
 
@@ -167,7 +153,7 @@ class AddressSynchronizer(Logger):
             return tx.outputs()[prevout_n].address
         return None
 
-    def get_txin_value(self, txin: TxInput, *, address: str = None) -> Optional[RavenValue]:
+    def get_txin_value(self, txin: TxInput, *, address: str = None) -> Optional[int]:
         if txin.value_sats() is not None:
             return txin.value_sats()
         prevout_hash = txin.prevout.txid.hex()
@@ -183,11 +169,7 @@ class AddressSynchronizer(Logger):
                 pass
         tx = self.db.get_transaction(prevout_hash)
         if tx:
-            txout = tx.outputs()[prevout_n]
-            if txout.asset:
-                return RavenValue(0, {txout.asset: txout.value})
-            else:
-                return RavenValue(txout.value)
+            return tx.outputs()[prevout_n].value
         return None
 
     def load_unverified_transactions(self):
@@ -228,10 +210,6 @@ class AddressSynchronizer(Logger):
             self.set_up_to_date(False)
         if self.synchronizer:
             self.synchronizer.add(address)
-
-    def add_asset(self, asset):
-        if self.synchronizer:
-            self.synchronizer.add_asset(asset)
 
     def get_conflicting_transactions(self, tx_hash, tx: Transaction, include_self=False):
         """Returns a set of transaction hashes from the wallet history that are
@@ -341,31 +319,11 @@ class AddressSynchronizer(Logger):
             # add outputs
             for n, txo in enumerate(tx.outputs()):
                 v = txo.value
-                asset = txo.asset
-                if asset:
-                    v = RavenValue(0, {asset: v})
-                else:
-                    v = RavenValue(v)
                 ser = tx_hash + ':%d'%n
-                scripthash = ravencoin.script_to_scripthash(txo.scriptpubkey)
+                scripthash = bitcoin.script_to_scripthash(txo.scriptpubkey.hex())
                 self.db.add_prevout_by_scripthash(scripthash, prevout=TxOutpoint.from_str(ser), value=v)
                 addr = txo.address
                 if addr and self.is_mine(addr):
-                    if txo.asset:
-                        if asset not in self.get_assets():
-                            self.add_asset(asset)
-                        try:
-                            d = pull_meta_from_create_or_reissue_script(txo.scriptpubkey)
-                            if d['type'] == 'r':
-                                self.db.add_asset_reissue_point(asset, ser, txo.scriptpubkey.hex())
-                        except:
-                            pass
-                        if is_asset_output_script_malformed(txo.scriptpubkey):
-                            self.db.add_nonstandard_outpoint(ser, txo.scriptpubkey.hex())
-
-                    if is_output_script_p2pk(txo.scriptpubkey):
-                        self.db.add_nonstandard_outpoint(ser, txo.scriptpubkey.hex())
-
                     self.db.add_txo_addr(tx_hash, addr, n, v, is_coinbase)
                     self._get_addr_balance_cache.pop(addr, None)  # invalidate cache
                     # give v to txi that spends me
@@ -373,7 +331,6 @@ class AddressSynchronizer(Logger):
                     if next_tx is not None:
                         self.db.add_txi_addr(next_tx, addr, ser, v)
                         self._add_tx_to_local_history(next_tx)
-
             # add to local history
             self._add_tx_to_local_history(tx_hash)
             # save
@@ -426,7 +383,7 @@ class AddressSynchronizer(Logger):
             self.unverified_tx.pop(tx_hash, None)
             if tx:
                 for idx, txo in enumerate(tx.outputs()):
-                    scripthash = ravencoin.script_to_scripthash(txo.scriptpubkey)
+                    scripthash = bitcoin.script_to_scripthash(txo.scriptpubkey.hex())
                     prevout = TxOutpoint(bfh(tx_hash), idx)
                     self.db.remove_prevout_by_scripthash(scripthash, prevout=prevout, value=txo.value)
 
@@ -439,16 +396,6 @@ class AddressSynchronizer(Logger):
                 children.add(other_hash)
                 children |= self.get_depending_transactions(other_hash)
             return children
-
-    def get_asset_reissue_outpoints(self, asset: str) -> Dict[str, str]:
-        return self.db.get_asset_reissue_points(asset)
-
-    def get_nonstandard_outpoints(self) -> Dict[str, str]:
-        return self.db.get_nonstandard_outpoints()
-
-    def recieve_asset_callback(self, asset: str, meta: AssetMeta):
-        self.db.add_asset_meta(asset, meta)
-        util.trigger_callback('asset_meta')
 
     def receive_tx_callback(self, tx_hash: str, tx: Transaction, tx_height: int) -> None:
         self.add_unverified_tx(tx_hash, tx_height)
@@ -548,7 +495,7 @@ class AddressSynchronizer(Logger):
         domain = set(domain)
         # 1. Get the history of each address in the domain, maintain the
         #    delta of a tx as the sum of its deltas on domain addresses
-        tx_deltas = defaultdict(RavenValue)  # type: Dict[str, RavenValue]
+        tx_deltas = defaultdict(int)  # type: Dict[str, int]
         for addr in domain:
             h = self.get_address_history(addr)
             for tx_hash, height in h:
@@ -574,7 +521,7 @@ class AddressSynchronizer(Logger):
             balance -= delta
         h2.reverse()
 
-        if balance != RavenValue():
+        if balance != 0:
             raise Exception("wallet.get_history() failed balance sanity-check")
 
         return h2
@@ -722,9 +669,9 @@ class AddressSynchronizer(Logger):
             return 0, 0
 
     @with_transaction_lock
-    def get_tx_delta(self, tx_hash: str, address: str) -> RavenValue:
+    def get_tx_delta(self, tx_hash: str, address: str) -> int:
         """effect of tx on address"""
-        delta = RavenValue()
+        delta = 0
         # subtract the value of coins sent from address
         d = self.db.get_txi_addr(tx_hash, address)
         for n, v in d:
@@ -739,7 +686,7 @@ class AddressSynchronizer(Logger):
         """effect of tx on wallet"""
         is_relevant = False  # "related to wallet?"
         num_input_ismine = 0
-        v_in = v_in_mine = v_out = v_out_mine = RavenValue()
+        v_in = v_in_mine = v_out = v_out_mine = 0
         with self.lock, self.transaction_lock:
             for txin in tx.inputs():
                 addr = self.get_txin_address(txin)
@@ -754,17 +701,13 @@ class AddressSynchronizer(Logger):
                 elif v_in is not None:
                     v_in += value
             for txout in tx.outputs():
-                if txout.asset:
-                    txout_v = RavenValue(0, {txout.asset: txout.value})
-                else:
-                    txout_v = RavenValue(txout.value)
-                v_out += txout_v
+                v_out += txout.value
                 if self.is_mine(txout.address):
-                    v_out_mine += txout_v
+                    v_out_mine += txout.value
                     is_relevant = True
         delta = v_out_mine - v_in_mine
         if v_in is not None:
-            fee = (v_in - v_out).rvn_value.value
+            fee = v_in - v_out
         else:
             fee = None
         if fee is None and isinstance(tx, PartialTransaction):
@@ -823,6 +766,7 @@ class AddressSynchronizer(Logger):
                     sent[txi] = height
         return received, sent
 
+
     def get_addr_outputs(self, address: str) -> Dict[TxOutpoint, PartialTxInput]:
         coins, spent = self.get_addr_io(address)
         out = {}
@@ -850,7 +794,7 @@ class AddressSynchronizer(Logger):
         return sum([v for height, v, is_cb in received.values()])
 
     @with_local_height_cached
-    def get_addr_balance(self, address, *, excluded_coins: Set[str] = None) -> Tuple[RavenValue, RavenValue, RavenValue]:
+    def get_addr_balance(self, address, *, excluded_coins: Set[str] = None) -> Tuple[int, int, int]:
         """Return the balance of a bitcoin address:
         confirmed and matured, unconfirmed, unmatured
         """
@@ -862,7 +806,7 @@ class AddressSynchronizer(Logger):
             excluded_coins = set()
         assert isinstance(excluded_coins, set), f"excluded_coins should be set, not {type(excluded_coins)}"
         received, sent = self.get_addr_io(address)
-        c = u = x = RavenValue()
+        c = u = x = 0
         mempool_height = self.get_local_height() + 1  # height of next block
         for txo, (tx_height, v, is_cb) in received.items():
             if txo in excluded_coins:
@@ -932,14 +876,14 @@ class AddressSynchronizer(Logger):
         return coins
 
     def get_balance(self, domain=None, *, excluded_addresses: Set[str] = None,
-                    excluded_coins: Set[str] = None) -> Tuple[RavenValue, RavenValue, RavenValue]:
+                    excluded_coins: Set[str] = None) -> Tuple[int, int, int]:
         if domain is None:
             domain = self.get_addresses()
         if excluded_addresses is None:
             excluded_addresses = set()
         assert isinstance(excluded_addresses, set), f"excluded_addresses should be set, not {type(excluded_addresses)}"
         domain = set(domain) - excluded_addresses
-        cc = uu = xx = RavenValue()
+        cc = uu = xx = 0
         for addr in domain:
             c, u, x = self.get_addr_balance(addr, excluded_coins=excluded_coins)
             cc += c

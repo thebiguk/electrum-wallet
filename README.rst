@@ -1,4 +1,4 @@
-Electrum - Lightweight Ravencoin client
+Electrum - Lightweight Bitcoin client
 =====================================
 
 ::
@@ -9,9 +9,16 @@ Electrum - Lightweight Ravencoin client
   Homepage: https://electrum.org/
 
 
+.. image:: https://api.cirrus-ci.com/github/spesmilo/electrum.svg?branch=master
+    :target: https://cirrus-ci.com/github/spesmilo/electrum
+    :alt: Build Status
+.. image:: https://coveralls.io/repos/github/spesmilo/electrum/badge.svg?branch=master
+    :target: https://coveralls.io/github/spesmilo/electrum?branch=master
+    :alt: Test coverage statistics
 .. image:: https://d322cqt584bo4o.cloudfront.net/electrum/localized.svg
-    :target: https://www.transifex.com/ravencoin/electrum-ravencoin/
+    :target: https://crowdin.com/project/electrum
     :alt: Help translate Electrum online
+
 
 
 
@@ -19,34 +26,17 @@ Electrum - Lightweight Ravencoin client
 Getting started
 ===============
 
-Contact us on `Discord`_!
+(*If you've come here looking to simply run Electrum,* `you may download it here`_.)
 
-Want to use Ledger? Make sure ledger live is closed.
-
-Want to mine to hardware? See this `article`_. Trezor has similar problems. It is recommended that you set up a software wallet and mine to that, then send to your hardware from there.
-
-Interested in a pre-built binary? Find them `here`_. Otherwise, continue reading.
-
-Electrum Ravencoin is currently only supported for Qt-based software.
-
-The master branch is not always guaranteed to be working as expected. If you would like to build from source or run raw python, please use the source from one of our `releases`_.
-
-Learn how to run your own `ElectrumX Server`_.
+.. _you may download it here: https://electrum.org/#download
 
 Electrum itself is pure Python, and so are most of the required dependencies,
 but not everything. The following sections describe how to run from source, but here
 is a TL;DR::
 
-    sudo apt-get install python3
-    sudo apt-get install python3-pip
-    sudo apt-get install python3-cryptography
-    sudo apt-get install python3-pyqt5
     sudo apt-get install libsecp256k1-0
-    sudo apt-get install cmake
-    sudo pip3 install virtualenv
-    ./electrum-env
-    
-If you get a protobuf _internal_create_key error, run sudo pip install --upgrade protobuf
+    python3 -m pip install --user .[gui,crypto]
+
 
 Not pure-python dependencies
 ----------------------------
@@ -77,11 +67,6 @@ If you would like hardware wallet support, see `this`_.
 .. _pycryptodomex: https://github.com/Legrandin/pycryptodome
 .. _cryptography: https://github.com/pyca/cryptography
 .. _this: https://github.com/spesmilo/electrum-docs/blob/master/hardware-linux.rst
-.. _here: https://github.com/Electrum-RVN-SIG/electrum-ravencoin/releases
-.. _Discord: https://discord.gg/VuubYncHz4
-.. _article: https://support.ledger.com/hc/en-us/articles/360018969814-Receive-mining-proceeds?docs=true
-.. _releases: https://github.com/Electrum-RVN-SIG/electrum-ravencoin/releases
-.. _`ElectrumX Server`: https://github.com/Electrum-RVN-SIG/electrumx-ravencoin
 
 Running from tar.gz
 -------------------
@@ -169,9 +154,12 @@ Any help testing the software, reporting or fixing bugs, reviewing pull requests
 and recent changes, writing tests, or helping with outstanding issues is very welcome.
 Implementing new features, or improving/refactoring the codebase, is of course
 also welcome, but to avoid wasted effort, especially for larger changes,
-we encourage discussing these on the discord first.
+we encourage discussing these on the issue tracker or IRC first.
 
-Besides `GitHub`_, most communication about Electrum development happens on discord, in the
-:code:`#electrum-rvn-sig` channel on discord.
+Besides `GitHub`_, most communication about Electrum development happens on IRC, in the
+:code:`#electrum` channel on Libera Chat. The easiest way to participate on IRC is
+with the web client, `web.libera.chat`_.
 
-.. _GitHub: https://github.com/Electrum-RVN-SIG/electrum-ravencoin
+
+.. _web.libera.chat: https://web.libera.chat/#electrum
+.. _GitHub: https://github.com/spesmilo/electrum

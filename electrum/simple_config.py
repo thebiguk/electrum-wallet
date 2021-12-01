@@ -20,19 +20,25 @@ from .i18n import _
 from .logging import get_logger, Logger
 
 
-FEE_ETA_TARGETS = [25, 10, 5, 2]
+FEE_ETA_TARGETS = []# [25, 10, 5, 2]
 FEE_DEPTH_TARGETS = [10000000, 5000000, 2000000, 1000000, 500000, 200000, 100000]
 FEE_LN_ETA_TARGET = 2  # note: make sure the network is asking for estimates for this target
 
 # satoshi per kbyte
-FEERATE_MAX_DYNAMIC = 1500000 * 1000
-FEERATE_WARNING_HIGH_FEE = 600000 * 1000
-FEERATE_FALLBACK_STATIC_FEE = 150000 * 1000
-FEERATE_DEFAULT_RELAY = 1000 * 1000
-FEERATE_MAX_RELAY = 50000 * 1000
-FEERATE_STATIC_VALUES = [1000 * 1000, 2000 * 1000, 5000 * 1000, 10000 * 1000, 20000 * 1000, 30000 * 1000,
-                         50000 * 1000, 70000 * 1000, 100000 * 1000, 150000 * 1000, 200000 * 1000, 300000 * 1000]
+FEERATE_MAX_DYNAMIC = 1500000
+FEERATE_WARNING_HIGH_FEE = 600000
+FEERATE_FALLBACK_STATIC_FEE = 150000
+FEERATE_DEFAULT_RELAY = 1000
+FEERATE_MAX_RELAY = 50000
+FEERATE_STATIC_VALUES = [1000, 2000, 5000, 10000, 20000, 30000,
+                         50000, 70000, 100000, 150000, 200000, 300000]
 FEERATE_REGTEST_HARDCODED = 180000  # for eclair compat
+
+# The min feerate_per_kw that can be used in lightning so that
+# the resulting onchain tx pays the min relay fee.
+# This would be FEERATE_DEFAULT_RELAY / 4 if not for rounding errors,
+# see https://github.com/ElementsProject/lightning/commit/2e687b9b352c9092b5e8bd4a688916ac50b44af0
+FEERATE_PER_KW_MIN_RELAY_LIGHTNING = 253
 
 FEE_RATIO_HIGH_WARNING = 0.05  # warn user if fee/amount for on-chain tx is higher than this
 
@@ -109,8 +115,7 @@ class SimpleConfig(Logger):
             decimal_point_to_base_unit_name(self.decimal_point)
         except UnknownBaseUnit:
             self.decimal_point = DECIMAL_POINT_DEFAULT
-
-        self.num_zeros = int(self.get('num_zeros', 1))
+        self.num_zeros = int(self.get('num_zeros', 0))
         self.amt_precision_post_satoshi = int(self.get('amt_precision_post_satoshi', 0))
         self.amt_add_thousands_sep = bool(self.get('amt_add_thousands_sep', False))
 
@@ -224,7 +229,7 @@ class SimpleConfig(Logger):
         base_unit = self.user_config.get('base_unit')
         if isinstance(base_unit, str):
             self._set_key_in_user_config('base_unit', None)
-            map_ = {'rvn': 8}  # , 'mbtc':5, 'ubtc':2, 'bits':2, 'sat':0}
+            map_ = {'btc':8, 'mbtc':5, 'ubtc':2, 'bits':2, 'sat':0}
             decimal_point = map_.get(base_unit.lower())
             self._set_key_in_user_config('decimal_point', decimal_point)
 
@@ -423,7 +428,7 @@ class SimpleConfig(Logger):
             return -1
         dist = map(lambda x: (x[0], abs(x[1] - fee_per_kb)), lst)
         min_target, min_value = min(dist, key=operator.itemgetter(1))
-        if fee_per_kb * 1000 < self.fee_estimates.get(FEE_ETA_TARGETS[0])/2:
+        if fee_per_kb < self.fee_estimates.get(FEE_ETA_TARGETS[0])/2:
             min_target = -1
         return min_target
 
@@ -566,6 +571,8 @@ class SimpleConfig(Logger):
 
         fee_level: float between 0.0 and 1.0, representing fee slider position
         """
+        if constants.net is constants.BitcoinRegtest:
+            return FEERATE_REGTEST_HARDCODED
         if dyn is None:
             dyn = self.is_dynfee()
         if mempool is None:
@@ -611,7 +618,6 @@ class SimpleConfig(Logger):
         fee_per_byte = fee_per_kb / 1000
         # to be consistent with what is displayed in the GUI,
         # the calculation needs to use the same precision:
-        fee_per_byte = quantize_feerate(fee_per_byte)
         fee_per_byte = quantize_feerate(fee_per_byte)
         return round(fee_per_byte * size)
 

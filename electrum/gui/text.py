@@ -9,9 +9,10 @@ import logging
 from typing import TYPE_CHECKING
 
 import electrum
+from electrum.gui import BaseElectrumGui
 from electrum import util
 from electrum.util import format_satoshis
-from electrum.ravencoin import is_address, COIN
+from electrum.bitcoin import is_address, COIN
 from electrum.transaction import PartialTxOutput
 from electrum.wallet import Wallet
 from electrum.wallet_db import WalletDB
@@ -28,11 +29,10 @@ if TYPE_CHECKING:
 _ = lambda x:x  # i18n
 
 
-class ElectrumGui:
+class ElectrumGui(BaseElectrumGui):
 
-    def __init__(self, config: 'SimpleConfig', daemon: 'Daemon', plugins: 'Plugins'):
-
-        self.config = config
+    def __init__(self, *, config: 'SimpleConfig', daemon: 'Daemon', plugins: 'Plugins'):
+        BaseElectrumGui.__init__(self, config=config, daemon=daemon, plugins=plugins)
         self.network = daemon.network
         storage = WalletStorage(config.get_wallet_path())
         if not storage.file_exists():
@@ -342,9 +342,6 @@ class ElectrumGui:
             curses.echo()
             curses.endwin()
 
-    def stop(self):
-        pass
-
     def do_clear(self):
         self.str_amount = ''
         self.str_recipient = ''
@@ -353,7 +350,7 @@ class ElectrumGui:
 
     def do_send(self):
         if not is_address(self.str_recipient):
-            self.show_message(_('Invalid ravencoin address'))
+            self.show_message(_('Invalid Bitcoin address'))
             return
         try:
             amount = int(Decimal(self.str_amount) * COIN)

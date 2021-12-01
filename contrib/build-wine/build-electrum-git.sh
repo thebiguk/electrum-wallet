@@ -1,6 +1,6 @@
 #!/bin/bash
 
-NAME_ROOT=electrum-ravencoin
+NAME_ROOT=electrum
 
 export PYTHONDONTWRITEBYTECODE=1  # don't create __pycache__/ folders with .pyc files
 
@@ -34,6 +34,7 @@ popd
 find -exec touch -d '2000-11-11T11:11:11+00:00' {} +
 popd
 
+
 # Install frozen dependencies
 $WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location \
     --cache-dir "$WINE_PIP_CACHE_DIR" -r "$CONTRIB"/deterministic-build/requirements.txt
@@ -43,12 +44,6 @@ $WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location \
 
 $WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location \
     --cache-dir "$WINE_PIP_CACHE_DIR" -r "$CONTRIB"/deterministic-build/requirements-hw.txt
-
-$WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location \
-   --cache-dir "$WINE_PIP_CACHE_DIR" -r "$CONTRIB"/deterministic-build/requirements-ravencoin.txt
-
-$WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location \
-   --cache-dir "$WINE_PIP_CACHE_DIR" -r "$CONTRIB"/deterministic-build/requirements-ravencoin-binaries.txt
 
 pushd $WINEPREFIX/drive_c/electrum
 # see https://github.com/pypa/pip/issues/2195 -- pip makes a copy of the entire directory
@@ -73,7 +68,7 @@ info "building NSIS installer"
 wine "$WINEPREFIX/drive_c/Program Files (x86)/NSIS/makensis.exe" /DPRODUCT_VERSION=$VERSION electrum.nsi
 
 cd dist
-mv electrum-ravencoin-setup.exe $NAME_ROOT-$VERSION-setup.exe
+mv electrum-setup.exe $NAME_ROOT-$VERSION-setup.exe
 cd ..
 
 info "Padding binaries to 8-byte boundaries, and fixing COFF image checksum in PE header"

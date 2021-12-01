@@ -31,8 +31,8 @@ from typing import Tuple, TYPE_CHECKING, Union, Sequence, Optional, Dict, List, 
 from functools import lru_cache
 from abc import ABC, abstractmethod
 
-from . import ravencoin, ecc, constants, bip32
-from .ravencoin import deserialize_privkey, serialize_privkey, BaseDecodeError
+from . import bitcoin, ecc, constants, bip32
+from .bitcoin import deserialize_privkey, serialize_privkey, BaseDecodeError
 from .transaction import Transaction, PartialTransaction, PartialTxInput, PartialTxOutput, TxInput
 from .bip32 import (convert_bip32_path_to_list_of_uint32, BIP32_PRIME,
                     is_xpub, is_xprv, BIP32Node, normalize_bip32_derivation,
@@ -309,7 +309,7 @@ class Deterministic_KeyStore(Software_KeyStore):
         return bool(self.seed)
 
     def get_seed_type(self) -> Optional[str]:
-        return self._seed_type + ' electrum' if self._seed_type else 'BIP39'
+        return self._seed_type
 
     def is_watching_only(self):
         return not self.has_seed()
@@ -323,11 +323,6 @@ class Deterministic_KeyStore(Software_KeyStore):
             raise Exception("a seed exists")
         self.seed = self.format_seed(seed)
         self._seed_type = seed_type(seed) or None
-
-    def add_passphrase(self, passphrase):
-        if self.passphrase:
-            raise Exception("a passphrase exists")
-        self.passphrase = passphrase
 
     def get_seed(self, password):
         if not self.has_seed():
@@ -611,15 +606,11 @@ class BIP32_KeyStore(Xpub, Deterministic_KeyStore):
         self.xprv = xprv
         self.add_xpub(bip32.xpub_from_xprv(xprv))
 
-    def add_xprv_from_seed(self, bip32_seed, xtype, derivation, *, seed=None, passphrase=None):
+    def add_xprv_from_seed(self, bip32_seed, xtype, derivation):
         rootnode = BIP32Node.from_rootseed(bip32_seed, xtype=xtype)
         node = rootnode.subkey_at_private_derivation(derivation)
         self.add_xprv(node.to_xprv())
         self.add_key_origin_from_root_node(derivation_prefix=derivation, root_node=rootnode)
-        if seed:
-            Deterministic_KeyStore.add_seed(self, seed)
-        if passphrase:
-            Deterministic_KeyStore.add_passphrase(self, passphrase)
 
     def get_private_key(self, sequence: Sequence[int], password):
         xprv = self.get_master_private_key(password)
@@ -633,7 +624,7 @@ class BIP32_KeyStore(Xpub, Deterministic_KeyStore):
         return cK, k
 
     def can_have_deterministic_lightning_xprv(self):
-        if (self._seed_type == 'segwit'
+        if (self.get_seed_type() == 'segwit'
                 and self.get_bip32_node_for_xpub().xtype == 'p2wpkh'):
             return True
         return False
@@ -920,11 +911,11 @@ def bip39_is_checksum_valid(
     return checksum == calculated_checksum, True
 
 
-def from_bip43_rootseed(root_seed, derivation, xtype=None, *, seed=None, passphrase=None):
+def from_bip43_rootseed(root_seed, derivation, xtype=None):
     k = BIP32_KeyStore({})
     if xtype is None:
         xtype = xtype_from_derivation(derivation)
-    k.add_xprv_from_seed(root_seed, xtype, derivation, seed=seed, passphrase=passphrase)
+    k.add_xprv_from_seed(root_seed, xtype, derivation)
     return k
 
 
@@ -1004,7 +995,7 @@ def is_old_mpk(mpk: str) -> bool:
 
 def is_address_list(text):
     parts = text.split()
-    return bool(parts) and all(ravencoin.is_address(x) for x in parts)
+    return bool(parts) and all(bitcoin.is_address(x) for x in parts)
 
 
 def get_private_keys(text, *, allow_spaces_inside_key=True, raise_on_error=False):
@@ -1014,7 +1005,7 @@ def get_private_keys(text, *, allow_spaces_inside_key=True, raise_on_error=False
         parts = list(filter(bool, parts))
     else:
         parts = text.split()
-    if bool(parts) and all(ravencoin.is_private_key(x, raise_on_error=raise_on_error) for x in parts):
+    if bool(parts) and all(bitcoin.is_private_key(x, raise_on_error=raise_on_error) for x in parts):
         return parts
 
 

@@ -40,12 +40,12 @@ import qrcode
 from qrcode import exceptions
 
 from electrum.simple_config import SimpleConfig
-from electrum.util import quantize_feerate, convert_bytes_to_ascii_safe
-from electrum.ravencoin import base_encode, NLOCKTIME_BLOCKHEIGHT_MAX
+from electrum.util import quantize_feerate
+from electrum.bitcoin import base_encode, NLOCKTIME_BLOCKHEIGHT_MAX
 from electrum.i18n import _
 from electrum.plugin import run_hook
 from electrum import simple_config
-from electrum.transaction import SerializationError, Transaction, PartialTransaction, PartialTxInput, RavenValue
+from electrum.transaction import SerializationError, Transaction, PartialTransaction, PartialTxInput
 from electrum.logging import get_logger
 
 from .util import (MessageBoxMixin, read_QIcon, Buttons, icon_path,
@@ -57,7 +57,7 @@ from .util import (MessageBoxMixin, read_QIcon, Buttons, icon_path,
 
 from .fee_slider import FeeSlider, FeeComboBox
 from .confirm_tx_dialog import TxEditor
-from .amountedit import FeerateEdit, RVNAmountEdit
+from .amountedit import FeerateEdit, BTCAmountEdit
 from .locktimeedit import LockTimeEdit
 
 if TYPE_CHECKING:
@@ -95,7 +95,7 @@ def show_transaction(tx: Transaction, *, parent: 'ElectrumWindow', desc=None, pr
 
 class BaseTxDialog(QDialog, MessageBoxMixin):
 
-    def __init__(self, *, parent: 'ElectrumWindow', desc, prompt_if_unsaved, finalized: bool, external_keypairs=None, mixed=False):
+    def __init__(self, *, parent: 'ElectrumWindow', desc, prompt_if_unsaved, finalized: bool, external_keypairs=None):
         '''Transactions in the wallet will show their description.
         Pass desc to give a description for txs not yet in the wallet.
         '''
@@ -103,7 +103,6 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         QDialog.__init__(self, parent=None)
         self.tx = None  # type: Optional[Transaction]
         self.external_keypairs = external_keypairs
-        self.mixed = mixed
         self.finalized = finalized
         self.main_window = parent
         self.config = parent.config
@@ -334,7 +333,7 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
 
         self.sign_button.setDisabled(True)
         self.main_window.push_top_level_window(self)
-        self.main_window.sign_tx(self.tx, callback=sign_done, external_keypairs=self.external_keypairs, mixed=self.mixed)
+        self.main_window.sign_tx(self.tx, callback=sign_done, external_keypairs=self.external_keypairs)
 
     def save(self):
         self.main_window.push_top_level_window(self)
@@ -445,9 +444,8 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         tx_item_fiat = None
         if (self.finalized  # ensures we don't use historical rates for tx being constructed *now*
                 and txid is not None and fx.is_enabled() and amount is not None):
-            # Only normal RVN has an assignable value
             tx_item_fiat = self.wallet.get_tx_item_fiat(
-                tx_hash=txid, amount_sat=abs(amount.rvn_value.value), fx=fx, tx_fee=fee)
+                tx_hash=txid, amount_sat=abs(amount), fx=fx, tx_fee=fee)
         lnworker_history = self.wallet.lnworker.get_onchain_history() if self.wallet.lnworker else {}
         if txid in lnworker_history:
             item = lnworker_history[txid]
@@ -490,7 +488,7 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         self.locktime_final_label.setText(locktime_final_str)
         if self.locktime_e.get_locktime() is None:
             self.locktime_e.set_locktime(self.tx.locktime)
-        # self.rbf_label.setText(_('Replace by fee') + f": {not self.tx.is_final()}")
+        self.rbf_label.setText(_('Replace by fee') + f": {not self.tx.is_final()}")
 
         if tx_mined_status.header_hash:
             self.block_hash_label.setText(_("Included in block: {}")
@@ -505,21 +503,15 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         elif amount is None:
             amount_str = ''
         else:
-            rvn = amount.rvn_value.value
-            assets = amount.assets
-            amounts = []
-            if rvn != 0:
-                amounts.append('{} {}'.format(format_amount(rvn), base_unit))
-            for asset, v in assets.items():
-                amounts.append('{} {}'.format(format_amount(v.value), asset))
-            amount_str = _("My amount") + ('s: ' if len(amounts) > 1 else ': ') + ', '.join(amounts)
-
+            if amount > 0:
+                amount_str = _("Amount received:") + ' %s'% format_amount(amount) + ' ' + base_unit
+            else:
+                amount_str = _("Amount sent:") + ' %s' % format_amount(-amount) + ' ' + base_unit
             if fx.is_enabled():
                 if tx_item_fiat:
                     amount_str += ' (%s)' % tx_item_fiat['fiat_value'].to_ui_string()
                 else:
-                    # Fiat value only for normal RVN
-                    amount_str += ' (%s)' % format_fiat_and_units(abs(amount.rvn_value.value))
+                    amount_str += ' (%s)' % format_fiat_and_units(abs(amount))
         if amount_str:
             self.amount_label.setText(amount_str)
         else:
@@ -611,15 +603,8 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
                 return self.txo_color_2fa.text_char_format
             return ext
 
-        def format_amount(amt: RavenValue):
-            rvn = amt.rvn_value.value
-            assets = amt.assets
-            amounts = []
-            if rvn != 0:
-                amounts.append(self.main_window.format_amount(rvn, whitespaces=True) + ' RVN')
-            for asset, sats in assets.items():
-                amounts.append('{} {}'.format(self.main_window.format_amount(sats.value, whitespaces=True), asset))
-            return ', '.join(amounts)
+        def format_amount(amt):
+            return self.main_window.format_amount(amt, whitespaces=True)
 
         i_text = self.inputs_textedit
         i_text.clear()
@@ -649,25 +634,11 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         o_text.setReadOnly(True)
         cursor = o_text.textCursor()
         for o in self.tx.outputs():
-            addr = o.get_ui_address_str()
-            if o.asset:
-                v = RavenValue(0, {o.asset: o.value})
-            else:
-                v = RavenValue(o.value)
+            addr, v = o.get_ui_address_str(), o.value
             cursor.insertText(addr, text_format(addr))
-            if v != RavenValue():
+            if v is not None:
                 cursor.insertText('\t', ext)
                 cursor.insertText(format_amount(v), ext)
-            elif 'SCRIPT' in addr:
-                h = addr.split(" ")[1]
-                b = bytes.fromhex(h)
-                start = 2 if b[1] == len(b[2:]) else 1  # First byte is always opcode
-                b = b[start:]
-                if b:
-                    cursor.insertBlock()
-                    cursor.insertText('ascii: ', ext)
-                    cursor.insertText(convert_bytes_to_ascii_safe(b), ext)
-
             cursor.insertBlock()
 
         self.txo_color_recv.legend_label.setVisible(tf_used_recv)
@@ -717,11 +688,11 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         vbox_right = QVBoxLayout()
         self.size_label = TxDetailLabel()
         vbox_right.addWidget(self.size_label)
-        # self.rbf_label = TxDetailLabel()
-        # vbox_right.addWidget(self.rbf_label)
-        # self.rbf_cb = QCheckBox(_('Replace by fee'))
-        # self.rbf_cb.setChecked(bool(self.config.get('use_rbf', True)))
-        # vbox_right.addWidget(self.rbf_cb)
+        self.rbf_label = TxDetailLabel()
+        vbox_right.addWidget(self.rbf_label)
+        self.rbf_cb = QCheckBox(_('Replace by fee'))
+        self.rbf_cb.setChecked(bool(self.config.get('use_rbf', True)))
+        vbox_right.addWidget(self.rbf_cb)
 
         self.locktime_final_label = TxDetailLabel()
         vbox_right.addWidget(self.locktime_final_label)
@@ -751,8 +722,8 @@ class BaseTxDialog(QDialog, MessageBoxMixin):
         vbox.addWidget(self.block_hash_label)
 
         # set visibility after parenting can be determined by Qt
-        # self.rbf_label.setVisible(self.finalized)
-        # self.rbf_cb.setVisible(not self.finalized)
+        self.rbf_label.setVisible(self.finalized)
+        self.rbf_cb.setVisible(not self.finalized)
         self.locktime_final_label.setVisible(self.finalized)
         self.locktime_setter_widget.setVisible(not self.finalized)
 
@@ -818,7 +789,6 @@ class PreviewTxDialog(BaseTxDialog, TxEditor):
             external_keypairs,
             window: 'ElectrumWindow',
             output_value: Union[int, str],
-            mixed = False
     ):
         TxEditor.__init__(
             self,
@@ -828,7 +798,7 @@ class PreviewTxDialog(BaseTxDialog, TxEditor):
             output_value=output_value,
         )
         BaseTxDialog.__init__(self, parent=window, desc='', prompt_if_unsaved=False,
-                              finalized=False, external_keypairs=external_keypairs, mixed=mixed)
+                              finalized=False, external_keypairs=external_keypairs)
         BlockingWaitingDialog(window, _("Preparing transaction..."),
                               lambda: self.update_tx(fallback_to_zero_fee=True))
         self.update()
@@ -850,7 +820,7 @@ class PreviewTxDialog(BaseTxDialog, TxEditor):
         self.feerate_e.textEdited.connect(partial(self.on_fee_or_feerate, self.feerate_e, False))
         self.feerate_e.editingFinished.connect(partial(self.on_fee_or_feerate, self.feerate_e, True))
 
-        self.fee_e = RVNAmountEdit(self.main_window.get_decimal_point)
+        self.fee_e = BTCAmountEdit(self.main_window.get_decimal_point)
         self.fee_e.textEdited.connect(partial(self.on_fee_or_feerate, self.fee_e, False))
         self.fee_e.editingFinished.connect(partial(self.on_fee_or_feerate, self.fee_e, True))
 
@@ -976,7 +946,7 @@ class PreviewTxDialog(BaseTxDialog, TxEditor):
 
         assert tx is not None
         size = tx.estimated_size()
-        fee = tx.get_fee().rvn_value.value
+        fee = tx.get_fee()
 
         self.size_e.setAmount(size)
         fiat_fee = self.main_window.format_fiat_and_units(fee)
@@ -1021,15 +991,15 @@ class PreviewTxDialog(BaseTxDialog, TxEditor):
             return
         assert self.tx
         self.finalized = True
-        # self.tx.set_rbf(self.rbf_cb.isChecked())
+        self.tx.set_rbf(self.rbf_cb.isChecked())
         locktime = self.locktime_e.get_locktime()
         if locktime is not None:
             self.tx.locktime = locktime
-        for widget in [self.fee_slider, self.fee_combo, self.feecontrol_fields, # self.rbf_cb,
+        for widget in [self.fee_slider, self.fee_combo, self.feecontrol_fields, self.rbf_cb,
                        self.locktime_setter_widget, self.locktime_e]:
             widget.setEnabled(False)
             widget.setVisible(False)
-        for widget in [self.locktime_final_label]: # [self.rbf_label, self.locktime_final_label]:
+        for widget in [self.rbf_label, self.locktime_final_label]:
             widget.setVisible(True)
         self.set_title()
         self.set_buttons_visibility()

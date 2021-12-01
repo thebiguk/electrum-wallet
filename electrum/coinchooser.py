@@ -24,12 +24,12 @@
 # SOFTWARE.
 from collections import defaultdict
 from math import floor, log10
-from typing import NamedTuple, List, Callable, Sequence, Union, Dict, Tuple, Optional
+from typing import NamedTuple, List, Callable, Sequence, Union, Dict, Tuple
 from decimal import Decimal
 
-from .ravencoin import sha256, COIN, is_address
-from .transaction import Transaction, TxOutput, PartialTransaction, PartialTxInput, PartialTxOutput, RavenValue
-from .util import NotEnoughFunds, Satoshis
+from .bitcoin import sha256, COIN, is_address
+from .transaction import Transaction, TxOutput, PartialTransaction, PartialTxInput, PartialTxOutput
+from .util import NotEnoughFunds
 from .logging import Logger
 
 
@@ -74,8 +74,8 @@ class PRNG:
 class Bucket(NamedTuple):
     desc: str
     weight: int                   # as in BIP-141
-    value: RavenValue             # in satoshis
-    effective_value: RavenValue   # estimate of value left after subtracting fees. in satoshis
+    value: int                    # in satoshis
+    effective_value: int          # estimate of value left after subtracting fees. in satoshis
     coins: List[PartialTxInput]   # UTXOs
     min_height: int               # min block height where a coin was confirmed
     witness: bool                 # whether any coin uses segwit
@@ -86,60 +86,19 @@ class ScoredCandidate(NamedTuple):
     tx: PartialTransaction
     buckets: List[Bucket]
 
-def strip_unneeded(bkts: List[Bucket], needs_more) -> List[Bucket]:
+
+def strip_unneeded(bkts: List[Bucket], sufficient_funds) -> List[Bucket]:
     '''Remove buckets that are unnecessary in achieving the spend amount'''
-    if not needs_more([], bucket_value_sum=RavenValue()):
+    if sufficient_funds([], bucket_value_sum=0):
         # none of the buckets are needed
         return []
-
-    a = sum([b.value for b in bkts], RavenValue()).assets.keys()
-
-    bkts_rvn = sorted([b for b in bkts if b.value.rvn_value.value != 0],
-                      key=lambda bkt: bkt.value.rvn_value.value, reverse=True)
-
-    bkts_asset = {asset: sorted([b for b in bkts if asset in b.value.assets.keys()],
-                                key=lambda bkt: bkt.value.assets[asset].value, reverse=True) for asset in a}
-
-    rvn_ptr = 0
-
-    asset_ptr = {asset: -1 for asset in a}
-
-    def get_rvn_bucket_value() -> RavenValue:
-        return bkts_rvn[rvn_ptr].value
-
-    def get_asset_bucket_value(asset) -> RavenValue:
-        return bkts_asset[asset][asset_ptr[asset]].value
-
-    def is_asset_done(asset):
-        return asset_ptr[asset]+1 == len(bkts_asset[asset])
-
-    def increment_asset_ptr(asset):
-        ptr = asset_ptr[asset]
-        asset_ptr[asset] = ptr + 1
-
-    def get_buckets() -> List[Bucket]:
-        return bkts_rvn[:rvn_ptr+1] + \
-               [bkt for asset, asset_bkts in bkts_asset.items() for bkt in asset_bkts[:asset_ptr[asset]+1]]
-
-    bucket_value_sum = RavenValue()
-
-    needed = {None}
-    while needed:
-        while needed == {None}:
-            bucket_value_sum += get_rvn_bucket_value()
-            needed = needs_more(get_buckets(), bucket_value_sum=bucket_value_sum)
-            if needed == {None} and rvn_ptr+1 == len(bkts_rvn):
-                raise Exception("keeping all RVN buckets is still not enough: {}".format(bucket_value_sum))
-            rvn_ptr += 1
-        while needed and needed != {None}:
-            asset = next(iter(needed))
-            increment_asset_ptr(asset)
-            bucket_value_sum += get_asset_bucket_value(asset)
-            needed = needs_more(get_buckets(), bucket_value_sum=bucket_value_sum)
-            if needed and (needed & {asset}) and is_asset_done(asset):
-                raise Exception("keeping all {} buckets is still not enough: {}".format(asset, bucket_value_sum))
-
-    return get_buckets()
+    bkts = sorted(bkts, key=lambda bkt: bkt.value, reverse=True)
+    bucket_value_sum = 0
+    for i in range(len(bkts)):
+        bucket_value_sum += (bkts[i]).value
+        if sufficient_funds(bkts[:i+1], bucket_value_sum=bucket_value_sum):
+            return bkts[:i+1]
+    raise Exception("keeping all buckets is still not enough")
 
 
 class CoinChooserBase(Logger):
@@ -156,7 +115,6 @@ class CoinChooserBase(Logger):
         buckets = defaultdict(list)  # type: Dict[str, List[PartialTxInput]]
         for key, coin in zip(keys, coins):
             buckets[key].append(coin)
-
         # fee_estimator returns fee to be paid, for given vbytes.
         # guess whether it is just returning a constant as follows.
         constant_fee = fee_estimator_vb(2000) == fee_estimator_vb(200)
@@ -167,7 +125,7 @@ class CoinChooserBase(Logger):
             # on this single bucket
             weight = sum(Transaction.estimated_input_weight(coin, witness)
                          for coin in coins)
-            value = sum([coin.value_sats() for coin in coins], RavenValue())
+            value = sum(coin.value_sats() for coin in coins)
             min_height = min(coin.block_height for coin in coins)
             assert min_height is not None
             # the fee estimator is typically either a constant or a linear function,
@@ -179,7 +137,7 @@ class CoinChooserBase(Logger):
                 # when converting from weight to vBytes, instead of rounding up,
                 # keep fractional part, to avoid overestimating fee
                 fee = fee_estimator_vb(Decimal(weight) / 4)
-                effective_value = value - RavenValue(fee)
+                effective_value = value - fee
             return Bucket(desc=desc,
                           weight=weight,
                           value=value,
@@ -195,70 +153,17 @@ class CoinChooserBase(Logger):
             -> Callable[[List[Bucket]], ScoredCandidate]:
         raise NotImplementedError
 
-    def _change_amounts(self, tx: PartialTransaction, count: int, fee_estimator_numchange,
-                        asset_divisions: Dict[str, int]) -> List[Tuple[Optional[str], int]]:
+    def _change_amounts(self, tx: PartialTransaction, count: int, fee_estimator_numchange) -> List[int]:
         # Break change up if bigger than max_change
-        output_amounts = [(o.asset, o.value) for o in tx.outputs()]
-        output_amounts_rvn = [t[1] for t in output_amounts if not t[0]]
-        ret_amt = []
-
-        # Each asset has a maximum of 1 vout amount
-        for asset, divisions in asset_divisions.items():
-            output_amounts_asset = [t[1] for t in output_amounts if t[0] == asset]
-            minimum_division = 10 ** -divisions
-            # Don't split change of less than min div or less than 0.02 BTC
-            max_change_asset = max(max([o.value for o in output_amounts_asset]) * 1.25,
-                                   max(minimum_division * COIN, 0.02 * COIN))
-
-            change_amount_asset = tx.get_fee().assets.get(asset, Satoshis(0)).value
-
-            # Get a handle on the precision of the output amounts; round our
-            # change to look similar
-            def trailing_zeroes(val):
-                s = str(val)
-                return len(s) - len(s.rstrip('0'))
-
-            zeroes = [trailing_zeroes(i) for i in output_amounts_asset]
-            min_zeroes = min(zeroes)
-
-            zeroes = [min_zeroes]
-
-            # Calculate change; randomize it a bit if using more than 1 output
-            remaining = change_amount_asset
-            amounts = []
-
-            # Last change output.  Round down to maximum precision but lose
-            # no more than 10**max_dp_to_round_for_privacy
-            # e.g. a max of 2 decimal places means losing 100 satoshis to fees
-            N = int(pow(10, min(0, zeroes[0])))
-            amount = (remaining // N) * N
-            amounts.append(amount)
-
-            assert sum(amounts) == change_amount_asset
-
-            amounts = [a for a in amounts if a > 0]
-
-            ret_amt += [(asset, amount) for amount in amounts]
-
-        if not output_amounts_rvn:
-            # Append an amount for the vout after our transaction fee
-            output_amounts_rvn = [Satoshis(max(0, tx.get_fee().rvn_value.value -
-                                  fee_estimator_numchange(1, asset_divisions.keys())))]
-
+        output_amounts = [o.value for o in tx.outputs()]
         # Don't split change of less than 0.02 BTC
-        max_change_rvn = max(max([o.value for o in output_amounts_rvn]) * 1.25, 0.02 * COIN)
+        max_change = max(max(output_amounts) * 1.25, 0.02 * COIN)
 
         # Use N change outputs
-        change_amount_rvn = 0
-        n = 1
-        for n1 in range(1, count + 1):
+        for n in range(1, count + 1):
             # How much is left if we add this many change outputs?
-            # tx.get_fee() returns our ins - outs
-            # i.e. what should be going in our vouts
-            n = n1
-            change_amount_rvn = max(0, tx.get_fee().rvn_value.value -
-                                    fee_estimator_numchange(n1, asset_divisions.keys()))
-            if change_amount_rvn // n1 <= max_change_rvn:
+            change_amount = max(0, tx.get_fee() - fee_estimator_numchange(n))
+            if change_amount // n <= max_change:
                 break
 
         # Get a handle on the precision of the output amounts; round our
@@ -267,7 +172,7 @@ class CoinChooserBase(Logger):
             s = str(val)
             return len(s) - len(s.rstrip('0'))
 
-        zeroes = [trailing_zeroes(i) for i in output_amounts_rvn]
+        zeroes = [trailing_zeroes(i) for i in output_amounts]
         min_zeroes = min(zeroes)
         max_zeroes = max(zeroes)
 
@@ -279,7 +184,7 @@ class CoinChooserBase(Logger):
             zeroes = [min_zeroes]
 
         # Calculate change; randomize it a bit if using more than 1 output
-        remaining = change_amount_rvn
+        remaining = change_amount
         amounts = []
         while n > 1:
             average = remaining / n
@@ -298,34 +203,29 @@ class CoinChooserBase(Logger):
         amount = (remaining // N) * N
         amounts.append(amount)
 
-        assert sum(amounts) <= change_amount_rvn
+        assert sum(amounts) <= change_amount
 
-        ret_amt += [(None, amount) for amount in amounts]
-
-        return ret_amt
+        return amounts
 
     def _change_outputs(self, tx: PartialTransaction, change_addrs, fee_estimator_numchange,
-                        dust_threshold, asset_divs: Dict[str, int], has_return: bool) -> List[PartialTxOutput]:
-        amounts = self._change_amounts(tx, len(change_addrs) - len(asset_divs), fee_estimator_numchange, asset_divs)
-        assert all([t[1] >= 0 for t in amounts])
-        assert len(change_addrs) >= len(amounts) - (1 if has_return else 0)
-        assert all([isinstance(amt, Tuple) for amt in amounts])
+                        dust_threshold) -> List[PartialTxOutput]:
+        amounts = self._change_amounts(tx, len(change_addrs), fee_estimator_numchange)
+        assert min(amounts) >= 0
+        assert len(change_addrs) >= len(amounts)
+        assert all([isinstance(amt, int) for amt in amounts])
         # If change is above dust threshold after accounting for the
         # size of the change output, add it to the transaction.
-        amounts = [amount for amount in amounts if amount[1] >= dust_threshold]
-        change = [PartialTxOutput.from_address_and_value(addr, Satoshis(amount[1]), amount[0])
+        amounts = [amount for amount in amounts if amount >= dust_threshold]
+        change = [PartialTxOutput.from_address_and_value(addr, amount)
                   for addr, amount in zip(change_addrs, amounts)]
         return change
 
     def _construct_tx_from_selected_buckets(self, *, buckets: Sequence[Bucket],
                                             base_tx: PartialTransaction, change_addrs,
                                             fee_estimator_w, dust_threshold,
-                                            base_weight,
-                                            wallet,
-                                            asset_divs: Dict[str, int],
-                                            has_return: bool) -> Tuple[PartialTransaction, List[PartialTxOutput]]:
+                                            base_weight) -> Tuple[PartialTransaction, List[PartialTxOutput]]:
         # make a copy of base_tx so it won't get mutated
-        tx = PartialTransaction.from_io(base_tx.inputs()[:], base_tx.outputs()[:], wallet=wallet)
+        tx = PartialTransaction.from_io(base_tx.inputs()[:], base_tx.outputs()[:])
 
         tx.add_inputs([coin for b in buckets for coin in b.coins])
         tx_weight = self._get_tx_weight(buckets, base_weight=base_weight)
@@ -339,18 +239,8 @@ class CoinChooserBase(Logger):
 
         # This takes a count of change outputs and returns a tx fee
         output_weight = 4 * Transaction.estimated_output_size_for_address(change_addrs[0])
-
-        def fee_estimator_assets(assets: List[str]) -> int:
-            weight = 0
-            for asset in assets:
-                weight += 4 * Transaction.estimated_output_size_for_address_with_asset(change_addrs[0], asset)
-            return weight
-
-        def fee_estimator_numchange(rvn_count: int, assets: List[str]) -> int:
-            return fee_estimator_w(tx_weight + rvn_count * output_weight +
-                                   fee_estimator_assets(assets))
-
-        change = self._change_outputs(tx, change_addrs, fee_estimator_numchange, dust_threshold, asset_divs, has_return)
+        fee_estimator_numchange = lambda count: fee_estimator_w(tx_weight + count * output_weight)
+        change = self._change_outputs(tx, change_addrs, fee_estimator_numchange, dust_threshold)
         tx.add_outputs(change)
 
         return tx, change
@@ -372,14 +262,12 @@ class CoinChooserBase(Logger):
             num_legacy_inputs = sum((not bucket.witness) * len(bucket.coins)
                                     for bucket in buckets)
             total_weight += num_legacy_inputs
+
         return total_weight
 
     def make_tx(self, *, coins: Sequence[PartialTxInput], inputs: List[PartialTxInput],
                 outputs: List[PartialTxOutput], change_addrs: Sequence[str],
-                fee_estimator_vb: Callable, dust_threshold: int,
-                asset_divs: Dict[str, int],
-                wallet,
-                coinbase_outputs=None) -> PartialTransaction:
+                fee_estimator_vb: Callable, dust_threshold: int) -> PartialTransaction:
         """Select unspent coins to spend to pay outputs.  If the change is
         greater than dust_threshold (after adding the change output to
         the transaction) it is kept, otherwise none is sent and it is
@@ -398,7 +286,7 @@ class CoinChooserBase(Logger):
         self.p = PRNG(b''.join(sorted(utxos)))
 
         # Copy the outputs so when adding change we don't modify "outputs"
-        base_tx = PartialTransaction.from_io(inputs[:], outputs[:], wallet=wallet)
+        base_tx = PartialTransaction.from_io(inputs[:], outputs[:])
         input_value = base_tx.input_value()
 
         # Weight of the transaction with no inputs and no change
@@ -406,54 +294,27 @@ class CoinChooserBase(Logger):
         # would be detected from inputs. The only side effect should be that the
         # marker and flag are excluded, which is compensated in get_tx_weight()
         # FIXME calculation will be off by this (2 wu) in case of RBF batching
-
         base_weight = base_tx.estimated_weight()
-
-        if coinbase_outputs:
-            base_weight = PartialTransaction.from_io(inputs[:], outputs[:] + coinbase_outputs, wallet=wallet).estimated_weight()
-
         spent_amount = base_tx.output_value()
 
         def fee_estimator_w(weight):
-            i = Transaction.virtual_size_from_weight(weight)
-            return fee_estimator_vb(i)
+            return fee_estimator_vb(Transaction.virtual_size_from_weight(weight))
 
-        def needs_more(buckets, *, bucket_value_sum: RavenValue):
+        def sufficient_funds(buckets, *, bucket_value_sum):
             '''Given a list of buckets, return True if it has enough
             value to pay for the transaction'''
             # assert bucket_value_sum == sum(bucket.value for bucket in buckets)  # expensive!
             total_input = input_value + bucket_value_sum
-            if total_input.rvn_value < spent_amount.rvn_value:  # shortcut for performance
-                return {None}
-            in_assets = total_input.assets
-            out_assets = spent_amount.assets
-            for asset in out_assets:
-                if asset not in in_assets:
-                    return {asset}
-                if in_assets[asset] < out_assets[asset]:
-                    return {asset}
+            if total_input < spent_amount:  # shortcut for performance
+                return False
             # any bitcoin tx must have at least 1 input by consensus
             # (check we add some new UTXOs now or already have some fixed inputs)
             if not buckets and not inputs:
-                return {None}
+                return False
             # note re performance: so far this was constant time
             # what follows is linear in len(buckets)
             total_weight = self._get_tx_weight(buckets, base_weight=base_weight)
-
-            fee = fee_estimator_w(total_weight)
-            total_out = spent_amount + RavenValue(fee)
-            out_assets = spent_amount.assets
-            ret_val = total_input.rvn_value >= total_out.rvn_value
-            if not ret_val:
-                return {None}
-            for asset in out_assets:
-                if asset not in in_assets:
-                    return {asset}
-                if in_assets[asset] < out_assets[asset]:
-                    return {asset}
-            return set()
-
-        has_return = any([o.value == 0 and o.scriptpubkey[0] == 0x6a for o in outputs])
+            return total_input >= spent_amount + fee_estimator_w(total_weight)
 
         def tx_from_buckets(buckets):
             return self._construct_tx_from_selected_buckets(buckets=buckets,
@@ -461,10 +322,7 @@ class CoinChooserBase(Logger):
                                                             change_addrs=change_addrs,
                                                             fee_estimator_w=fee_estimator_w,
                                                             dust_threshold=dust_threshold,
-                                                            base_weight=base_weight,
-                                                            wallet=wallet,
-                                                            asset_divs=asset_divs,
-                                                            has_return=has_return)
+                                                            base_weight=base_weight)
 
         # Collect the coins into buckets
         all_buckets = self.bucketize_coins(coins, fee_estimator_vb=fee_estimator_vb)
@@ -472,13 +330,10 @@ class CoinChooserBase(Logger):
         # Note that this filtering is intentionally done on the bucket level
         # instead of per-coin, as each bucket should be either fully spent or not at all.
         # (e.g. CoinChooserPrivacy ensures that same-address coins go into one bucket)
-        all_buckets = list(filter(lambda b: b.effective_value.rvn_value.value > 0 or
-                                            len(b.value.assets) > 0, all_buckets))
-
+        all_buckets = list(filter(lambda b: b.effective_value > 0, all_buckets))
         # Choose a subset of the buckets
-        scored_candidate = self.choose_buckets(all_buckets, needs_more,
-                                               self.penalty_func(base_tx, tx_from_buckets=tx_from_buckets),
-                                               coinbase_outputs=coinbase_outputs)
+        scored_candidate = self.choose_buckets(all_buckets, sufficient_funds,
+                                               self.penalty_func(base_tx, tx_from_buckets=tx_from_buckets))
         tx = scored_candidate.tx
 
         self.logger.info(f"using {len(tx.inputs())} inputs")
@@ -487,17 +342,17 @@ class CoinChooserBase(Logger):
         return tx
 
     def choose_buckets(self, buckets: List[Bucket],
-                       needs_more: Callable,
-                       penalty_func: Callable[[List[Bucket]], ScoredCandidate],
-                       coinbase_outputs) -> ScoredCandidate:
+                       sufficient_funds: Callable,
+                       penalty_func: Callable[[List[Bucket]], ScoredCandidate]) -> ScoredCandidate:
         raise NotImplemented('To be subclassed')
 
 
 class CoinChooserRandom(CoinChooserBase):
-    def bucket_candidates_any(self, buckets: List[Bucket], needs_more) -> List[List[Bucket]]:
+
+    def bucket_candidates_any(self, buckets: List[Bucket], sufficient_funds) -> List[List[Bucket]]:
         '''Returns a list of bucket sets.'''
         if not buckets:
-            if not needs_more([], bucket_value_sum=RavenValue()):
+            if sufficient_funds([], bucket_value_sum=0):
                 return [[]]
             else:
                 raise NotEnoughFunds()
@@ -506,7 +361,7 @@ class CoinChooserRandom(CoinChooserBase):
 
         # Add all singletons
         for n, bucket in enumerate(buckets):
-            if not needs_more([bucket], bucket_value_sum=bucket.value):
+            if sufficient_funds([bucket], bucket_value_sum=bucket.value):
                 candidates.add((n,))
 
         # And now some random ones
@@ -517,12 +372,12 @@ class CoinChooserRandom(CoinChooserBase):
             # incrementally combine buckets until sufficient
             self.p.shuffle(permutation)
             bkts = []
-            bucket_value_sum = RavenValue()
+            bucket_value_sum = 0
             for count, index in enumerate(permutation):
                 bucket = buckets[index]
                 bkts.append(bucket)
                 bucket_value_sum += bucket.value
-                if not needs_more(bkts, bucket_value_sum=bucket_value_sum):
+                if sufficient_funds(bkts, bucket_value_sum=bucket_value_sum):
                     candidates.add(tuple(sorted(permutation[:count + 1])))
                     break
             else:
@@ -530,10 +385,10 @@ class CoinChooserRandom(CoinChooserBase):
                 raise NotEnoughFunds()
 
         candidates = [[buckets[n] for n in c] for c in candidates]
-        return [strip_unneeded(c, needs_more) for c in candidates]
+        return [strip_unneeded(c, sufficient_funds) for c in candidates]
 
     def bucket_candidates_prefer_confirmed(self, buckets: List[Bucket],
-                                           needs_more) -> List[List[Bucket]]:
+                                           sufficient_funds) -> List[List[Bucket]]:
         """Returns a list of bucket sets preferring confirmed coins.
 
         Any bucket can be:
@@ -551,35 +406,33 @@ class CoinChooserRandom(CoinChooserBase):
 
         bucket_sets = [conf_buckets, unconf_buckets, other_buckets]
         already_selected_buckets = []
-        already_selected_buckets_value_sum = RavenValue()
+        already_selected_buckets_value_sum = 0
 
         for bkts_choose_from in bucket_sets:
             try:
-                def sfunds(bkts, *, bucket_value_sum: RavenValue):
+                def sfunds(bkts, *, bucket_value_sum):
                     bucket_value_sum += already_selected_buckets_value_sum
-                    return needs_more(already_selected_buckets + bkts,
+                    return sufficient_funds(already_selected_buckets + bkts,
                                             bucket_value_sum=bucket_value_sum)
 
                 candidates = self.bucket_candidates_any(bkts_choose_from, sfunds)
                 break
             except NotEnoughFunds:
                 already_selected_buckets += bkts_choose_from
-                already_selected_buckets_value_sum += sum([bucket.value for bucket in bkts_choose_from], RavenValue())
+                already_selected_buckets_value_sum += sum(bucket.value for bucket in bkts_choose_from)
         else:
             raise NotEnoughFunds()
 
         candidates = [(already_selected_buckets + c) for c in candidates]
-        return [strip_unneeded(c, needs_more) for c in candidates]
+        return [strip_unneeded(c, sufficient_funds) for c in candidates]
 
-    def choose_buckets(self, buckets, needs_more, penalty_func, coinbase_outputs):
-        candidates = self.bucket_candidates_prefer_confirmed(buckets, needs_more)
+    def choose_buckets(self, buckets, sufficient_funds, penalty_func):
+        candidates = self.bucket_candidates_prefer_confirmed(buckets, sufficient_funds)
         scored_candidates = [penalty_func(cand) for cand in candidates]
         winner = min(scored_candidates, key=lambda x: x.penalty)
         self.logger.info(f"Total number of buckets: {len(buckets)}")
         self.logger.info(f"Num candidates considered: {len(candidates)}. "
                          f"Winning penalty: {winner.penalty}")
-        if coinbase_outputs:
-            winner.tx.add_outputs(coinbase_outputs)
         return winner
 
 
@@ -598,15 +451,14 @@ class CoinChooserPrivacy(CoinChooserRandom):
         return [coin.scriptpubkey.hex() for coin in coins]
 
     def penalty_func(self, base_tx, *, tx_from_buckets):
-        # This is per bucket; we dont care about RavenValues; just values
-        min_change = min(o.value.value for o in base_tx.outputs()) * 0.75
-        max_change = max(o.value.value for o in base_tx.outputs()) * 1.33
+        min_change = min(o.value for o in base_tx.outputs()) * 0.75
+        max_change = max(o.value for o in base_tx.outputs()) * 1.33
 
         def penalty(buckets: List[Bucket]) -> ScoredCandidate:
             # Penalize using many buckets (~inputs)
             badness = len(buckets) - 1
             tx, change_outputs = tx_from_buckets(buckets)
-            change = sum(o.value.value for o in change_outputs)
+            change = sum(o.value for o in change_outputs)
             # Penalize change not roughly in output range
             if change == 0:
                 pass  # no change is great!
@@ -642,6 +494,6 @@ def get_coin_chooser(config):
     #       + it also helps the network as a whole as fees will become noisier
     #         (trying to counter the heuristic that "whole integer sat/byte feerates" are common)
     coinchooser = klass(
-        enable_output_value_rounding=config.get('coin_chooser_output_rounding', False),
+        enable_output_value_rounding=config.get('coin_chooser_output_rounding', True),
     )
     return coinchooser

@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QLineEdit, QStyle, QStyleOptionFrame, QSizePolicy)
 from .util import char_width_in_lineedit, ColorScheme
 
 from electrum.util import (format_satoshis_plain, decimal_point_to_base_unit_name,
-                           FEERATE_PRECISION, quantize_feerate, base_units_list)
+                           FEERATE_PRECISION, quantize_feerate)
 
 
 class FreezableLineEdit(QLineEdit):
@@ -19,7 +19,6 @@ class FreezableLineEdit(QLineEdit):
     def setFrozen(self, b):
         self.setReadOnly(b)
         self.setFrame(not b)
-        self.setStyleSheet(ColorScheme.GRAY.as_stylesheet() if b else ColorScheme.DEFAULT.as_stylesheet())
         self.frozen.emit()
 
 
@@ -29,6 +28,7 @@ class SizedFreezableLineEdit(FreezableLineEdit):
         super().__init__(parent)
         self._width = width
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.setMaximumWidth(width)
 
     def sizeHint(self) -> QSize:
         sh = super().sizeHint()
@@ -95,7 +95,7 @@ class AmountEdit(SizedFreezableLineEdit):
         self.setText("%d"%x)
 
 
-class RVNAmountEdit(AmountEdit):
+class BTCAmountEdit(AmountEdit):
 
     def __init__(self, decimal_point, is_int=False, parent=None):
         AmountEdit.__init__(self, self._base_unit, is_int, parent)
@@ -128,13 +128,7 @@ class RVNAmountEdit(AmountEdit):
         self.repaint()  # macOS hack for #6269
 
 
-class PayToAmountEdit(RVNAmountEdit):
-    def __init__(self, decimal_point, asset_base_unit, is_int=False, parent=None):
-        AmountEdit.__init__(self, asset_base_unit, is_int, parent)
-        self.decimal_point = lambda: decimal_point() if asset_base_unit() in base_units_list else 8
-
-
-class FeerateEdit(RVNAmountEdit):
+class FeerateEdit(BTCAmountEdit):
 
     def __init__(self, decimal_point, is_int=False, parent=None):
         super().__init__(decimal_point, is_int, parent)
@@ -144,7 +138,7 @@ class FeerateEdit(RVNAmountEdit):
         return 'sat/byte'
 
     def get_amount(self):
-        sat_per_byte_amount = RVNAmountEdit.get_amount(self)
+        sat_per_byte_amount = BTCAmountEdit.get_amount(self)
         return quantize_feerate(sat_per_byte_amount)
 
     def setAmount(self, amount):
